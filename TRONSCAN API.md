@@ -11,3 +11,6 @@ Statistics:https://docs.tronscan.org/api-endpoints/statistics
 Deep Analysis:https://docs.tronscan.org/api-endpoints/deep-analysis
 Protocol Revenue Service API:https://docs.tronscan.org/total-protocol-revenue/protocol-revenue-service-api
 Security Service API:https://docs.tronscan.org/security-service/security-service-api
+资源模型:https://tronprotocol.github.io/documentation-zh/mechanism-algorithm/resource/
+Introduction to Dynamic Energy Model:https://medium.com/tronnetwork/introduction-to-dynamic-energy-model-31917419b61a
+GetDelegatedResource:https://developers.tron.network/reference/getdelegatedresource
