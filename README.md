@@ -28,6 +28,13 @@ cd tron-energy-finder
 pip install -r requirements.txt
 ```
 
+3. API配置
+复制`.env.example`文件命名为`.env`：
+```bash
+cp .env.example .env
+```
+然后编辑.env文件，填写自己的API KEY。
+
 ## 使用方法
 
 直接运行主程序：
