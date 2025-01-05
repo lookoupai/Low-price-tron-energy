@@ -52,20 +52,20 @@ class TronEnergyFinder:
         if not addresses:
             return
             
-        # 加载已有结果
+        # 加载当天的结果文件
         results = self._load_existing_results()
         
-        # 获取已存在的地址集合
-        existing_addresses = {record["address"] for record in results["records"]}
+        # 获取已存在的代理哈希集合
+        existing_proxy_hashes = {record["proxy_tx_hash"] for record in results["records"]}
         
         # 添加新记录
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         new_records = []
         for addr in addresses:
-            if addr["address"] not in existing_addresses:
+            if addr["proxy_tx_hash"] not in existing_proxy_hashes:
                 addr["found_time"] = current_time
                 new_records.append(addr)
-                existing_addresses.add(addr["address"])
+                existing_proxy_hashes.add(addr["proxy_tx_hash"])
         
         if new_records:
             # 将新记录放在最前面
@@ -76,9 +76,9 @@ class TronEnergyFinder:
             with open(result_file, "w", encoding="utf-8") as f:
                 json.dump(results, f, ensure_ascii=False, indent=2)
             
-            print(f"\n✅ 已保存 {len(new_records)} 个新地址到文件: {result_file}")
+            print(f"\n✅ 已保存 {len(new_records)} 个新记录到文件: {result_file}")
         else:
-            print("\n📝 没有新的地址需要保存")
+            print("\n📝 没有新的记录需要保存")
         
     def _make_request(self, url: str, params: Dict) -> Optional[Dict]:
         """带重试机制的请求方法"""
@@ -349,7 +349,7 @@ class TronEnergyFinder:
             return None
 
     def find_low_cost_energy_addresses(self):
-        """主函数：查找低价能量地址"""
+        """主函数：查找低价TRON能量地址"""
         print("🔍 开始查找低价TRON能量地址...")
         
         # 获取最新区块
@@ -367,17 +367,15 @@ class TronEnergyFinder:
             return
             
         found_addresses = []
-        unique_addresses = set()
         
         # 分析每个代理资源交易的接收地址
         for tx in tqdm(transactions, desc="分析交易"):
             try:
                 # 获取接收地址
                 address = tx.get("toAddress")
-                if not address or address in unique_addresses:
+                if not address:
                     continue
                     
-                unique_addresses.add(address)
                 result = self.analyze_address(address)
                 if result:
                     found_addresses.append(result)
@@ -402,11 +400,16 @@ class TronEnergyFinder:
             
         print("\n🎉 找到以下低价能量地址：\n")
         for addr in addresses:
+            # 如果是计算值，添加提示信息
+            energy_display = addr['energy_quantity']
+            if addr['energy_source'] == "计算值":
+                energy_display = f"{energy_display} (计算值，仅供参考)"
+                
             print(f"""🔹 【收款地址】: {addr['address']}
 🔹 【能量提供方】: {addr['energy_provider']}
 🔹 【购买记录】: https://tronscan.org/#/address/{addr['address']}
 🔹 【收款金额】: {addr['purchase_amount']} TRX
-🔹 【能量数量】: {addr['energy_quantity']} ({addr['energy_source']})
+🔹 【能量数量】: {energy_display}
 🔹 【24h交易数】: {addr['recent_tx_count']} 笔
 🔹 【转账哈希】: {addr['tx_hash']}
 🔹 【代理哈希】: {addr['proxy_tx_hash']}
