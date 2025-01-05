@@ -1,27 +1,50 @@
+我有一段用于查找低成本能量代理地址的Python代码，代码逻辑已经实现并运行良好。现在，我想基于这段代码开发一个Telegram机器人，功能需求如下：
+
+1. **频道功能**：
+   - 当将机器人加入一个频道时，机器人应定时（例如，每隔一小时）发布最新获取到的地址信息到该频道。
+
+2. **私聊功能**：
+   - 当用户私聊机器人时，用户可以通过发送特定命令（例如 `/query`）让机器人立即执行一次地址查询，并将结果返回给用户。
+
+请使用 `python-telegram-bot` 框架来开发这个Telegram机器人，并整合我提供的代码逻辑。请确保以下几点：
+
+- **环境变量**：
+  - 使用 `.env` 文件来管理敏感信息，如Telegram Bot的API Token。
+  
+- **定时任务**：
+  - 使用 `APScheduler` 或类似的库来实现定时发布功能。
+  
+- **命令处理**：
+  - 实现至少一个命令（例如 `/query`）来触发地址查询，并将结果以用户友好的格式发送回用户。
+  
+- **代码结构**：
+  - 代码应模块化，分为主要的机器人逻辑、命令处理、定时任务和原有的地址查找逻辑。
+  
+- **错误处理**：
+  - 机器人应具备基本的错误处理能力，确保在发生异常时不会崩溃，并能向用户提供有用的错误信息。
+
+- **依赖管理**：
+  - 提供一个 `requirements.txt` 文件，列出所有必要的Python依赖包。
+
+请基于以下提供的Python代码，生成完整的Telegram机器人代码，并附上必要的说明和使用指南。
+
+```python
 import requests
 import json
 import time
 from datetime import datetime
 from tqdm import tqdm
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional
 import os
 from dotenv import load_dotenv
 import pathlib
 
-# 配置日志级别
-import logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.WARNING
-)
-logger = logging.getLogger(__name__)
+# 加载环境变量
+load_dotenv()
 
 class TronEnergyFinder:
     def __init__(self):
-        # 加载环境变量
-        load_dotenv()
-        
-        self.tronscan_api = "https://apilist.tronscan.org/api"
+        self.tronscan_api = "https://apilist.tronscan.org/api"  # TronScan API
         
         # TronScan API Key
         self.headers = {
@@ -30,16 +53,11 @@ class TronEnergyFinder:
         }
         
         self.retry_count = 3
-        self.retry_delay = 2
+        self.retry_delay = 2  # 秒
         
         # 创建results目录
         self.results_dir = pathlib.Path("results")
         self.results_dir.mkdir(exist_ok=True)
-        
-        # 初始化缓存
-        self._analyzed_addresses: Set[str] = set()
-        self._energy_amount_cache: Dict[str, float] = {}
-        self._transaction_info_cache: Dict[str, Dict] = {}
         
     def _get_result_file(self) -> pathlib.Path:
         """获取当天的结果文件路径"""
@@ -102,9 +120,9 @@ class TronEnergyFinder:
                 return response.json()
             except Exception as e:
                 if attempt == self.retry_count - 1:
-                    logger.error(f"请求失败 ({url}): {e}")
+                    print(f"请求失败 ({url}): {e}")
                     return None
-                logger.warning(f"请求失败，{self.retry_delay}秒后重试: {e}")
+                print(f"请求失败，{self.retry_delay}秒后重试: {e}")
                 time.sleep(self.retry_delay)
         return None
 
@@ -211,55 +229,36 @@ class TronEnergyFinder:
             return []
 
     def get_transaction_info(self, tx_hash: str) -> Dict:
-        """获取交易详细信息（带缓存）"""
-        if tx_hash in self._transaction_info_cache:
-            return self._transaction_info_cache[tx_hash]
-            
+        """获取交易详细信息"""
         try:
             response = self._make_request(f"{self.tronscan_api}/transaction-info", {
                 "hash": tx_hash
             })
-            if response:
-                self._transaction_info_cache[tx_hash] = response
             return response or {}
         except Exception as e:
-            logger.error(f"获取交易详情失败: {e}")
+            print(f"获取交易详情失败: {e}")
             return {}
 
     def get_energy_amount(self, tx_hash: str) -> Optional[float]:
-        """获取交易中的实际能量数量（带缓存）"""
-        if tx_hash in self._energy_amount_cache:
-            return self._energy_amount_cache[tx_hash]
-            
+        """获取交易中的实际能量数量"""
         tx_info = self.get_transaction_info(tx_hash)
         if tx_info and "contractData" in tx_info:
             contract_data = tx_info["contractData"]
-            energy_amount = None
-            
             # 优先使用 resourceValue 字段
             if "resourceValue" in contract_data:
-                energy_amount = float(contract_data["resourceValue"])
+                print(f"使用 API 值: {contract_data['resourceValue']}")
+                return float(contract_data["resourceValue"])
             # 如果没有 resourceValue，则使用 balance 计算
             elif "balance" in contract_data:
+                print(f"使用计算值: balance = {contract_data['balance']}")
                 staked_trx = float(contract_data["balance"]) / 1_000_000
-                energy_amount = staked_trx * 11.3661
-                
-            if energy_amount is not None:
-                self._energy_amount_cache[tx_hash] = energy_amount
-                return energy_amount
-                
+                return staked_trx * 11.3661
         return None
 
     def analyze_address(self, address: str) -> Optional[Dict]:
-        """分析地址的交易记录（带缓存）"""
-        # 检查是否已分析过
-        if address in self._analyzed_addresses:
-            return None
-            
-        self._analyzed_addresses.add(address)
-        
+        """分析地址的交易记录"""
         try:
-            logger.info(f"分析地址: {address}")
+            print(f"\n分析地址: {address}")
             
             # 获取地址的最近交易记录
             response = self._make_request(f"{self.tronscan_api}/transaction", {
@@ -275,56 +274,60 @@ class TronEnergyFinder:
             
             # 先找到代理资源交易
             for i, tx in enumerate(transactions):
+                # 检查是否是代理资源交易
                 if tx.get("contractType") == 57:
                     contract_data = tx.get("contractData", {})
                     if contract_data.get("resource") == "ENERGY":
+                        # 获取代理能量数量
                         proxy_time = tx.get("timestamp", 0)
-                        energy_provider = contract_data.get("owner_address")
+                        energy_provider = contract_data.get("owner_address")  # 能量提供方
                         
-                        # 向后查找是否有对应的TRX转账
+                        # 向后查找是否有对应的TRX转账（时间更早的交易）
                         for j in range(i + 1, len(transactions)):
                             prev_tx = transactions[j]
-                            if (prev_tx.get("contractType") == 1 and 
-                                prev_tx.get("timestamp", 0) < proxy_time):
+                            if (prev_tx.get("contractType") == 1 and  # TRX 转账
+                                prev_tx.get("timestamp", 0) < proxy_time):  # 确保转账在代理之前
                                 try:
-                                    amount = float(prev_tx.get("amount", 0)) / 1_000_000
-                                    amount = round(amount, 4)
-                                    if 0.1 <= amount <= 1:
+                                    amount = float(prev_tx.get("amount", 0)) / 1_000_000  # 转换为TRX
+                                    amount = round(amount, 4)  # 四舍五入到4位小数
+                                    if 0.1 <= amount <= 1:  # 金额范围改回0.1-1 TRX
+                                        # 获取收取TRX的地址
                                         trx_receiver = prev_tx.get("toAddress")
                                         
                                         # 获取收款地址的最近交易记录
-                                        receiver_response = self._make_request(
-                                            f"{self.tronscan_api}/transaction",
-                                            {
-                                                "address": trx_receiver,
-                                                "limit": 50,
-                                                "sort": "-timestamp"
-                                            }
-                                        )
+                                        receiver_response = self._make_request(f"{self.tronscan_api}/transaction", {
+                                            "address": trx_receiver,
+                                            "limit": 50,
+                                            "sort": "-timestamp"
+                                        })
                                         
                                         if not receiver_response or "data" not in receiver_response:
                                             continue
                                             
                                         receiver_txs = receiver_response["data"]
+                                        
+                                        # 分析收款地址的最近交易
                                         current_time = int(time.time() * 1000)
                                         amount_count = {}
                                         
-                                        # 分析收款地址的最近交易
-                                        for rtx in receiver_txs:
+                                        print(f"\n分析收款地址 {trx_receiver} 的最近交易...")
+                                        for rtx in receiver_txs:  # 分析所有获取到的交易
+                                            # 检查是否在24小时内
                                             tx_time = rtx.get("timestamp", 0)
                                             if current_time - tx_time > 24 * 60 * 60 * 1000:
                                                 continue
                                                 
-                                            if rtx.get("contractType") == 1:
+                                            if rtx.get("contractType") == 1:  # TRX转账
                                                 try:
                                                     rtx_amount = float(rtx.get("amount", 0)) / 1_000_000
                                                     rtx_amount = round(rtx_amount, 4)
-                                                    if 0.1 <= rtx_amount <= 1:
+                                                    if 0.1 <= rtx_amount <= 1:  # 金额范围0.1-1 TRX
                                                         amount_count[rtx_amount] = amount_count.get(rtx_amount, 0) + 1
+                                                        print(f"找到符合金额范围的TRX转账: {rtx_amount} TRX, 当前计数: {amount_count[rtx_amount]}")
                                                 except (ValueError, TypeError):
                                                     continue
                                         
-                                        # 检查交易数量
+                                        # 检查是否有至少5笔相同金额的交易
                                         max_count = max(amount_count.values()) if amount_count else 0
                                         max_amount = None
                                         for amt, cnt in amount_count.items():
@@ -332,17 +335,28 @@ class TronEnergyFinder:
                                                 max_amount = amt
                                                 break
                                                 
+                                        # 确保24小时内至少有20笔交易
                                         if max_count >= 5 and sum(amount_count.values()) >= 20:
+                                            # 获取实际能量数量
                                             energy_amount = self.get_energy_amount(tx.get("hash"))
                                             
                                             if energy_amount is None:
+                                                # 如果获取失败，使用合约数据计算
                                                 staked_trx = float(contract_data.get("balance", 0)) / 1_000_000
                                                 energy_amount = staked_trx * 11.3661
                                                 energy_source = "计算值"
                                             else:
                                                 energy_source = "API值"
-                                                
-                                            logger.info(f"找到符合条件的地址: {trx_receiver}")
+                                            
+                                            print(f"找到符合条件的交易对:")
+                                            print(f"TRX转账: {prev_tx.get('hash')} - {amount} TRX")
+                                            print(f"收款地址: {trx_receiver}")
+                                            print(f"代理资源: {tx.get('hash')} - {energy_amount:,.2f} 能量 ({energy_source})")
+                                            print(f"能量提供方: {energy_provider}")
+                                            print(f"24小时内相同金额交易数: {max_count}")
+                                            print(f"24小时内总交易数: {sum(amount_count.values())}")
+                                            print(f"最多交易的金额: {max_amount} TRX")
+                                            print(f"24小时内金额统计: {amount_count}")
                                             
                                             return {
                                                 "address": trx_receiver,
@@ -362,7 +376,7 @@ class TronEnergyFinder:
             return None
             
         except Exception as e:
-            logger.error(f"分析地址 {address} 时出错: {e}")
+            print(f"分析地址 {address} 时出错: {e}")
             return None
 
     def find_low_cost_energy_addresses(self):
@@ -371,51 +385,57 @@ class TronEnergyFinder:
             # 获取最新区块
             latest_block = self.get_latest_block()
             if not latest_block:
-                logger.error("获取最新区块失败")
-                return []
+                print("❌ 获取最新区块失败")
+                return
                 
-            logger.info(f"最新区块号: {latest_block}")
+            print(f"最新区块号: {latest_block}")
             
             # 初始化结果列表和计数器
             found_addresses = []
             current_block = latest_block
-            max_blocks_to_check = 1
+            max_blocks_to_check = 3  # 最多检查10个区块
             blocks_checked = 0
             
-            # 清空缓存
-            self._analyzed_addresses.clear()
-            self._energy_amount_cache.clear()
-            self._transaction_info_cache.clear()
-            
+            # 持续查找区块，直到找到符合条件的地址或达到最大检查区块数
             while blocks_checked < max_blocks_to_check:
-                logger.info(f"正在检查区块 {current_block}...")
+                print(f"\n正在检查区块 {current_block}...")
                 
+                # 获取区块交易
                 transactions = self.get_block_transactions(current_block)
                 
+                # 分析每个代理交易
                 for tx in transactions:
                     contract_data = tx.get("contractData", {})
                     if (tx.get("contractType") == 57 and 
                         contract_data.get("resource") == "ENERGY"):
                         
+                        # 获取代理能量数量
+                        energy_amount = self.get_energy_amount(tx.get("hash"))
+                        if energy_amount is None:
+                            continue
+                            
+                        # 分析接收方地址
                         receiver_address = contract_data.get("receiver_address")
                         if receiver_address:
                             address_info = self.analyze_address(receiver_address)
                             if address_info:
                                 found_addresses.append(address_info)
+                                # 找到符合条件的地址后，立即保存并返回结果
                                 self._save_results(found_addresses)
                                 self._print_results(found_addresses)
                                 return found_addresses
                 
+                # 如果当前区块没有找到，继续检查前一个区块
                 current_block -= 1
                 blocks_checked += 1
                 
             if not found_addresses:
-                logger.warning(f"检查了 {blocks_checked} 个区块后仍未找到符合条件的地址")
+                print(f"\n⚠️ 检查了 {blocks_checked} 个区块后仍未找到符合条件的地址")
             
             return found_addresses
             
         except Exception as e:
-            logger.error(f"查找低成本能量代理地址时发生错误: {e}")
+            print(f"查找低成本能量代理地址时发生错误: {e}")
             return []
 
     def _print_results(self, addresses):
@@ -454,3 +474,4 @@ def main():
 
 if __name__ == "__main__":
     main() 
+```
