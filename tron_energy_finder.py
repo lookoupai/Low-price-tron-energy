@@ -349,49 +349,64 @@ class TronEnergyFinder:
             return None
 
     def find_low_cost_energy_addresses(self):
-        """主函数：查找低价TRON能量地址"""
-        print("🔍 开始查找低价TRON能量地址...")
-        
-        # 获取最新区块
-        latest_block = self.get_latest_block()
-        if not latest_block:
-            print("获取最新区块失败")
-            return
-            
-        print(f"\n📦 正在分析区块 {latest_block}")
-        
-        # 获取区块交易
-        transactions = self.get_block_transactions(latest_block)
-        if not transactions:
-            print("未找到代理资源交易记录")
-            return
-            
-        found_addresses = []
-        
-        # 分析每个代理资源交易的接收地址
-        for tx in tqdm(transactions, desc="分析交易"):
-            try:
-                # 获取接收地址
-                address = tx.get("toAddress")
-                if not address:
-                    continue
-                    
-                result = self.analyze_address(address)
-                if result:
-                    found_addresses.append(result)
+        """查找低成本能量代理地址"""
+        try:
+            # 获取最新区块
+            latest_block = self.get_latest_block()
+            if not latest_block:
+                print("❌ 获取最新区块失败")
+                return
                 
-            except Exception as e:
-                print(f"处理交易时出错: {e}")
-                continue
+            print(f"最新区块号: {latest_block}")
             
-            time.sleep(0.5)  # 避免请求过快
+            # 初始化结果列表和计数器
+            found_addresses = []
+            current_block = latest_block
+            max_blocks_to_check = 3  # 最多检查10个区块
+            blocks_checked = 0
             
-        # 输出结果
-        self._print_results(found_addresses)
-        
-        # 保存结果
-        self._save_results(found_addresses)
-        
+            # 持续查找区块，直到找到符合条件的地址或达到最大检查区块数
+            while blocks_checked < max_blocks_to_check:
+                print(f"\n正在检查区块 {current_block}...")
+                
+                # 获取区块交易
+                transactions = self.get_block_transactions(current_block)
+                
+                # 分析每个代理交易
+                for tx in transactions:
+                    contract_data = tx.get("contractData", {})
+                    if (tx.get("contractType") == 57 and 
+                        contract_data.get("resource") == "ENERGY"):
+                        
+                        # 获取代理能量数量
+                        energy_amount = self.get_energy_amount(tx.get("hash"))
+                        if energy_amount is None:
+                            continue
+                            
+                        # 分析接收方地址
+                        receiver_address = contract_data.get("receiver_address")
+                        if receiver_address:
+                            address_info = self.analyze_address(receiver_address)
+                            if address_info:
+                                found_addresses.append(address_info)
+                                # 找到符合条件的地址后，立即保存并返回结果
+                                self._save_results(found_addresses)
+                                self._print_results(found_addresses)
+                                return found_addresses
+                
+                # 如果当前区块没有找到，继续检查前一个区块
+                current_block -= 1
+                blocks_checked += 1
+                
+            if not found_addresses:
+                print(f"\n⚠️ 检查了 {blocks_checked} 个区块后仍未找到符合条件的地址")
+            
+            return found_addresses
+            
+        except Exception as e:
+            print(f"查找低成本能量代理地址时发生错误: {e}")
+            return []
+
     def _print_results(self, addresses):
         """格式化输出结果"""
         if not addresses:
