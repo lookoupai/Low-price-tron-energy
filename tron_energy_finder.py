@@ -14,14 +14,22 @@ import random
 
 # 配置日志级别
 import logging
+
+# 配置日志
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,  # 改为 INFO 级别以显示更多信息
+    level=logging.INFO,  # 默认日志级别为 INFO
     handlers=[
-        logging.StreamHandler(),  # 输出到控制台
-        logging.FileHandler('tron_energy_finder.log')  # 同时保存到文件
+        logging.StreamHandler(),  # 只输出到控制台
     ]
 )
+
+# 设置第三方库的日志级别为 WARNING，减少不必要的日志
+logging.getLogger("asyncio").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 class APIKeyManager:
@@ -80,25 +88,26 @@ class TronEnergyFinder:
         current_dir = os.getcwd()
         env_path = os.path.join(current_dir, '.env')
         
-        logger.info(f"当前目录: {current_dir}")
-        logger.info(f"环境变量文件路径: {env_path}")
-        logger.info(f"环境变量文件是否存在: {os.path.exists(env_path)}")
+        # 减少初始化时的日志输出
+        logger.debug(f"当前目录: {current_dir}")
+        logger.debug(f"环境变量文件路径: {env_path}")
+        logger.debug(f"环境变量文件是否存在: {os.path.exists(env_path)}")
         
-        # 获取 API Keys（支持更多Key）
+        # 获取 API Keys
         api_keys = []
         i = 1
-        while True:  # 无限循环直到找不到更多的Key
+        while True:
             key = os.getenv(f"TRON_API_KEY_{i}")
-            if not key:  # 如果找不到这个编号的Key就退出
+            if not key:
                 break
             api_keys.append(key)
-            logger.info(f"成功加载 TRON_API_KEY_{i}: {key[:8]}...")
+            logger.debug(f"成功加载 TRON_API_KEY_{i}: {key[:8]}...")  # 改为 DEBUG 级别
             i += 1
         
         if not api_keys:
             raise ValueError("请在.env文件中设置至少一个 TRON_API_KEY")
         
-        logger.info(f"总共加载了 {len(api_keys)} 个 API Key")
+        logger.info(f"成功加载 {len(api_keys)} 个 API Key")  # 保留重要信息为 INFO 级别
         
         self.api_manager = APIKeyManager(api_keys)
         self.tronscan_api = "https://apilist.tronscanapi.com/api"
@@ -235,7 +244,8 @@ class TronEnergyFinder:
         self._analyzed_addresses.add(address)
         
         try:
-            logger.info(f"分析地址: {address}")
+            # 减少日志输出，只在 DEBUG 级别输出详细信息
+            logger.debug(f"分析地址: {address}")
             
             # 获取地址的最近交易记录
             response = await self._make_request(f"{self.tronscan_api}/transaction", {
@@ -312,7 +322,7 @@ class TronEnergyFinder:
                                                 
                                         # 只在找到符合条件的交易时输出日志
                                         if max_count >= 5 and total_count >= 20:
-                                            logger.info(f"地址 {trx_receiver} 24小时内总交易: {total_count}笔，最多重复金额: {max_count}笔")
+                                            logger.info(f"找到符合条件的地址: {address}")
                                             energy_amount = await self.get_energy_amount(tx.get("hash"))
                                             
                                             if energy_amount is None:
@@ -322,10 +332,8 @@ class TronEnergyFinder:
                                             else:
                                                 energy_source = "API值"
                                                 
-                                            logger.info(f"找到符合条件的地址: {trx_receiver}")
-                                            
                                             return {
-                                                "address": trx_receiver,
+                                                "address": address,
                                                 "energy_provider": energy_provider,
                                                 "purchase_amount": max_amount,
                                                 "energy_quantity": f"{energy_amount:,.2f} 能量",
@@ -342,7 +350,7 @@ class TronEnergyFinder:
             return None
             
         except Exception as e:
-            logger.error(f"分析地址 {address} 时出错: {e}")
+            logger.error(f"分析地址时出错: {e}")
             return None
 
     async def _save_results(self, addresses: List[Dict]):
@@ -430,7 +438,7 @@ class TronEnergyFinder:
                 return []
                 
             total_transactions = response.get("total", 0)
-            logger.info(f"正在检查区块 {block_number}，总交易数: {total_transactions}")
+            logger.debug(f"正在检查区块 {block_number}，总交易数: {total_transactions}")  # 改为 DEBUG 级别
             
             # 分批获取所有交易
             all_transactions = []
@@ -481,7 +489,7 @@ class TronEnergyFinder:
                         proxy_transactions.append(tx)
             
             if proxy_transactions:
-                logger.info(f"区块 {block_number} 找到 {len(proxy_transactions)} 笔代理资源交易")
+                logger.debug(f"区块 {block_number} 找到 {len(proxy_transactions)} 笔代理资源交易")  # 改为 DEBUG 级别
                 # 缓存结果
                 self._block_cache[cache_key] = proxy_transactions
             else:
