@@ -110,7 +110,7 @@ class TronEnergyFinder:
         logger.info(f"成功加载 {len(api_keys)} 个 API Key")  # 保留重要信息为 INFO 级别
         
         self.api_manager = APIKeyManager(api_keys)
-        self.tronscan_api = "https://apilist.tronscanapi.com/api"
+        self.tronscan_api = "https://apilist.tronscan.org/api"
         
         # 创建results目录
         self.results_dir = pathlib.Path("results")
@@ -311,7 +311,7 @@ class TronEnergyFinder:
                                                         total_count += 1
                                                 except (ValueError, TypeError):
                                                     continue
-                                                    
+                                        
                                         # 检查交易数量
                                         max_count = max(amount_count.values()) if amount_count else 0
                                         max_amount = None
@@ -322,7 +322,7 @@ class TronEnergyFinder:
                                                 
                                         # 只在找到符合条件的交易时输出日志
                                         if max_count >= 5 and total_count >= 20:
-                                            logger.info(f"找到符合条件的地址: {address}")
+                                            logger.info(f"找到符合条件的地址: {trx_receiver}")
                                             energy_amount = await self.get_energy_amount(tx.get("hash"))
                                             
                                             if energy_amount is None:
@@ -333,7 +333,7 @@ class TronEnergyFinder:
                                                 energy_source = "API值"
                                                 
                                             return {
-                                                "address": address,
+                                                "address": trx_receiver,
                                                 "energy_provider": energy_provider,
                                                 "purchase_amount": max_amount,
                                                 "energy_quantity": f"{energy_amount:,.2f} 能量",
@@ -342,7 +342,7 @@ class TronEnergyFinder:
                                                 "proxy_tx_hash": tx.get("hash"),
                                                 "recent_tx_count": total_count,
                                                 "recent_tx_amount": max_amount,
-                                                "status": "正常使用"
+                                                "status": "正常使用"  # 直接使用"正常使用"状态
                                             }
                                 except (ValueError, TypeError):
                                     continue
@@ -438,38 +438,37 @@ class TronEnergyFinder:
                 return []
                 
             total_transactions = response.get("total", 0)
-            logger.debug(f"正在检查区块 {block_number}，总交易数: {total_transactions}")  # 改为 DEBUG 级别
+            logger.info(f"正在检查区块 {block_number}，总交易数: {total_transactions}")
             
             # 分批获取所有交易
             all_transactions = []
             start = 0
             limit = 200  # 每次获取200条
             
-            # 创建并发任务
-            async def fetch_batch(start_pos):
-                return await self._make_request(f"{self.tronscan_api}/transaction", {
+            while start < total_transactions:
+                # 添加请求延迟
+                await asyncio.sleep(0.5)  # 避免请求过快
+                
+                response = await self._make_request(f"{self.tronscan_api}/transaction", {
                     "block": str(block_number),
                     "limit": str(limit),
-                    "start": str(start_pos),
+                    "start": str(start),
                     "count": "true"
                 })
-            
-            # 并发执行请求
-            tasks = []
-            while start < total_transactions:
-                tasks.append(fetch_batch(start))
-                start += limit
-            
-            # 等待所有请求完成
-            responses = await asyncio.gather(*tasks)
-            
-            # 处理响应
-            for response in responses:
-                if response and "data" in response:
-                    transactions = response.get("data", [])
-                    if transactions:
-                        all_transactions.extend(transactions)
-                        logger.debug(f"已获取 {len(all_transactions)}/{total_transactions} 条交易记录")
+                
+                if not response or "data" not in response:
+                    # 如果请求失败，重试当前批次
+                    logger.warning(f"获取区块 {block_number} 交易失败，重试中...")
+                    await asyncio.sleep(1)  # 等待1秒后重试
+                    continue
+                    
+                transactions = response.get("data", [])
+                if not transactions:
+                    break
+                    
+                all_transactions.extend(transactions)
+                start += len(transactions)
+                logger.info(f"已获取 {len(all_transactions)}/{total_transactions} 条交易记录")
             
             # 筛选代理资源交易
             proxy_transactions = []
@@ -487,13 +486,18 @@ class TronEnergyFinder:
                         "owner_address" in contract_data):
                         
                         proxy_transactions.append(tx)
+                        logger.info(f"找到代理资源交易:\n"
+                                  f"交易哈希: {tx.get('hash')}\n"
+                                  f"发送人: {contract_data.get('owner_address')}\n"
+                                  f"接收人: {contract_data.get('receiver_address')}\n"
+                                  f"代理数量: {contract_data.get('balance', 0) / 1_000_000 * 11.3661:,.2f} 能量")
             
             if proxy_transactions:
-                logger.debug(f"区块 {block_number} 找到 {len(proxy_transactions)} 笔代理资源交易")  # 改为 DEBUG 级别
+                logger.info(f"区块 {block_number} 找到 {len(proxy_transactions)} 笔代理资源交易")
                 # 缓存结果
                 self._block_cache[cache_key] = proxy_transactions
             else:
-                logger.debug(f"区块 {block_number} 未找到代理资源交易记录")
+                logger.info(f"区块 {block_number} 未找到代理资源交易记录")
                 
             return proxy_transactions
             
