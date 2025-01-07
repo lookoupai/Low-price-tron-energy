@@ -1,6 +1,6 @@
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from tqdm import tqdm
 from typing import List, Dict, Optional, Set
 import os
@@ -10,6 +10,7 @@ import asyncio
 from asyncio import Lock
 from cachetools import TTLCache
 import aiohttp
+import random
 
 # 配置日志级别
 import logging
@@ -23,55 +24,99 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class APIKeyManager:
+    def __init__(self, api_keys: List[str]):
+        """初始化 API Key 管理器"""
+        self.api_keys = api_keys
+        self.current_key_index = 0
+        self.request_times = {key: [] for key in api_keys}  # 记录每个 key 的请求时间
+        self.daily_request_count = 0  # 记录当天的总请求次数
+        self.last_reset_time = datetime.now()  # 上次重置计数的时间
+        self._lock = asyncio.Lock()
+        
+    async def get_next_key(self) -> str:
+        """获取下一个可用的 API Key"""
+        async with self._lock:
+            # 检查是否需要重置每日计数
+            now = datetime.now()
+            if now.date() > self.last_reset_time.date():
+                self.daily_request_count = 0
+                self.last_reset_time = now
+            
+            # 检查是否达到每日限制
+            if self.daily_request_count >= 100000:
+                raise Exception("已达到每日 API 请求限制")
+            
+            # 清理超过1秒的请求记录
+            current_time = time.time()
+            for key in self.api_keys:
+                self.request_times[key] = [t for t in self.request_times[key] 
+                                         if current_time - t < 1]
+            
+            # 查找可用的 key
+            for _ in range(len(self.api_keys)):
+                key = self.api_keys[self.current_key_index]
+                if len(self.request_times[key]) < 5:  # 每秒限制5次
+                    self.request_times[key].append(current_time)
+                    self.daily_request_count += 1
+                    return key
+                
+                self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+            
+            # 如果所有 key 都达到限制，等待最早的请求过期
+            earliest_time = min(min(times) for times in self.request_times.values() if times)
+            wait_time = max(0, 1 - (current_time - earliest_time))
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            return await self.get_next_key()
+
 class TronEnergyFinder:
     def __init__(self):
-        # 获取当前文件所在目录
-        current_dir = pathlib.Path(__file__).parent.absolute()
-        env_path = current_dir / '.env'
+        """初始化 Tron 能量查找器"""
+        # 加载环境变量
+        load_dotenv()
+        
+        # 获取当前目录
+        current_dir = os.getcwd()
+        env_path = os.path.join(current_dir, '.env')
         
         logger.info(f"当前目录: {current_dir}")
         logger.info(f"环境变量文件路径: {env_path}")
-        logger.info(f"环境变量文件是否存在: {env_path.exists()}")
+        logger.info(f"环境变量文件是否存在: {os.path.exists(env_path)}")
         
-        # 加载环境变量
-        load_dotenv(dotenv_path=env_path)
+        # 获取 API Keys（支持更多Key）
+        api_keys = []
+        i = 1
+        while True:  # 无限循环直到找不到更多的Key
+            key = os.getenv(f"TRON_API_KEY_{i}")
+            if not key:  # 如果找不到这个编号的Key就退出
+                break
+            api_keys.append(key)
+            logger.info(f"成功加载 TRON_API_KEY_{i}: {key[:8]}...")
+            i += 1
         
-        # 检查并记录 API Key 状态
-        api_key = os.getenv("TRON_API_KEY")
-        if not api_key:
-            logger.warning("未设置TRON_API_KEY环境变量，TronScan API访问可能受限")
-            logger.warning("请在.env文件中设置TRON_API_KEY=你的TronScan API密钥")
-        else:
-            logger.info(f"成功加载 TRON_API_KEY: {api_key[:8]}...")
+        if not api_keys:
+            raise ValueError("请在.env文件中设置至少一个 TRON_API_KEY")
         
-        self.tronscan_api = "https://apilist.tronscan.org/api"
+        logger.info(f"总共加载了 {len(api_keys)} 个 API Key")
         
-        # TronScan API Key
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "TRON-PRO-API-KEY": api_key or ""
-        }
-        
-        self.retry_count = 3
-        self.retry_delay = 2
+        self.api_manager = APIKeyManager(api_keys)
+        self.tronscan_api = "https://apilist.tronscanapi.com/api"
         
         # 创建results目录
         self.results_dir = pathlib.Path("results")
         self.results_dir.mkdir(exist_ok=True)
         
         # 初始化缓存
-        self._analyzed_addresses: Set[str] = set()
-        self._energy_amount_cache: Dict[str, float] = {}
-        self._transaction_info_cache: Dict[str, Dict] = {}
+        self._block_cache = {}  # 区块缓存
+        self._analyzed_addresses = set()  # 已分析的地址集合
+        self._energy_amount_cache = {}  # 能量数量缓存
+        self._transaction_info_cache = {}  # 交易信息缓存
+        self._results_cache = TTLCache(maxsize=100, ttl=60)  # 结果缓存60秒
         
         # 添加锁机制
         self._api_lock = Lock()
         self._cache_lock = Lock()
-        
-        # 添加缓存
-        self._results_cache = TTLCache(maxsize=100, ttl=60)  # 结果缓存60秒
-        self._block_cache = TTLCache(maxsize=10, ttl=30)     # 区块缓存30秒
-        self._tx_cache = TTLCache(maxsize=1000, ttl=300)     # 交易缓存5分钟
         
         # 添加API请求限制
         self._last_api_call = 0
@@ -103,25 +148,29 @@ class TronEnergyFinder:
             await asyncio.sleep(self._min_api_interval)
         self._last_api_call = current_time
         
-    async def _make_request(self, url: str, params: Dict) -> Optional[Dict]:
-        """带限制和重试机制的异步请求方法"""
-        async with self._api_lock:
-            await self._wait_for_api_limit()
+    async def _make_request(self, url: str, params: Dict = None) -> Optional[Dict]:
+        """发送 API 请求"""
+        try:
+            # 获取下一个可用的 API Key
+            api_key = await self.api_manager.get_next_key()
             
-            for attempt in range(self.retry_count):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, params=params, headers=self.headers) as response:
-                            response.raise_for_status()
-                            return await response.json()
-                except Exception as e:
-                    if attempt == self.retry_count - 1:
-                        logger.error(f"请求失败 ({url}): {e}")
+            headers = {
+                "TRON-PRO-API-KEY": api_key,
+                "Accept": "application/json"
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        logger.error(f"API请求失败: {response.status} - {await response.text()}")
                         return None
-                    logger.warning(f"请求失败，{self.retry_delay}秒后重试: {e}")
-                    await asyncio.sleep(self.retry_delay)
+                        
+        except Exception as e:
+            logger.error(f"请求失败: {e}")
             return None
-            
+
     async def get_latest_block(self) -> Optional[int]:
         """获取最新区块号"""
         try:
@@ -388,25 +437,31 @@ class TronEnergyFinder:
             start = 0
             limit = 200  # 每次获取200条
             
-            while start < total_transactions:
-                response = await self._make_request(f"{self.tronscan_api}/transaction", {
+            # 创建并发任务
+            async def fetch_batch(start_pos):
+                return await self._make_request(f"{self.tronscan_api}/transaction", {
                     "block": str(block_number),
                     "limit": str(limit),
-                    "start": str(start),
+                    "start": str(start_pos),
                     "count": "true"
                 })
-                
-                if not response or "data" not in response:
-                    break
-                    
-                transactions = response.get("data", [])
-                if not transactions:
-                    break
-                    
-                all_transactions.extend(transactions)
-                start += len(transactions)
-                logger.debug(f"已获取 {len(all_transactions)}/{total_transactions} 条交易记录")
-                await asyncio.sleep(0.5)  # 避免请求过快
+            
+            # 并发执行请求
+            tasks = []
+            while start < total_transactions:
+                tasks.append(fetch_batch(start))
+                start += limit
+            
+            # 等待所有请求完成
+            responses = await asyncio.gather(*tasks)
+            
+            # 处理响应
+            for response in responses:
+                if response and "data" in response:
+                    transactions = response.get("data", [])
+                    if transactions:
+                        all_transactions.extend(transactions)
+                        logger.debug(f"已获取 {len(all_transactions)}/{total_transactions} 条交易记录")
             
             # 筛选代理资源交易
             proxy_transactions = []
