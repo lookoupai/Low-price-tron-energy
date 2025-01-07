@@ -1,4 +1,3 @@
-import requests
 import json
 import time
 from datetime import datetime
@@ -7,26 +6,50 @@ from typing import List, Dict, Optional, Set
 import os
 from dotenv import load_dotenv
 import pathlib
+import asyncio
+from asyncio import Lock
+from cachetools import TTLCache
+import aiohttp
 
 # 配置日志级别
 import logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.WARNING
+    level=logging.INFO,  # 改为 INFO 级别以显示更多信息
+    handlers=[
+        logging.StreamHandler(),  # 输出到控制台
+        logging.FileHandler('tron_energy_finder.log')  # 同时保存到文件
+    ]
 )
 logger = logging.getLogger(__name__)
 
 class TronEnergyFinder:
     def __init__(self):
+        # 获取当前文件所在目录
+        current_dir = pathlib.Path(__file__).parent.absolute()
+        env_path = current_dir / '.env'
+        
+        logger.info(f"当前目录: {current_dir}")
+        logger.info(f"环境变量文件路径: {env_path}")
+        logger.info(f"环境变量文件是否存在: {env_path.exists()}")
+        
         # 加载环境变量
-        load_dotenv()
+        load_dotenv(dotenv_path=env_path)
+        
+        # 检查并记录 API Key 状态
+        api_key = os.getenv("TRON_API_KEY")
+        if not api_key:
+            logger.warning("未设置TRON_API_KEY环境变量，TronScan API访问可能受限")
+            logger.warning("请在.env文件中设置TRON_API_KEY=你的TronScan API密钥")
+        else:
+            logger.info(f"成功加载 TRON_API_KEY: {api_key[:8]}...")
         
         self.tronscan_api = "https://apilist.tronscan.org/api"
         
         # TronScan API Key
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "TRON-PRO-API-KEY": os.getenv("TRON_API_KEY", "")
+            "TRON-PRO-API-KEY": api_key or ""
         }
         
         self.retry_count = 3
@@ -40,6 +63,19 @@ class TronEnergyFinder:
         self._analyzed_addresses: Set[str] = set()
         self._energy_amount_cache: Dict[str, float] = {}
         self._transaction_info_cache: Dict[str, Dict] = {}
+        
+        # 添加锁机制
+        self._api_lock = Lock()
+        self._cache_lock = Lock()
+        
+        # 添加缓存
+        self._results_cache = TTLCache(maxsize=100, ttl=60)  # 结果缓存60秒
+        self._block_cache = TTLCache(maxsize=10, ttl=30)     # 区块缓存30秒
+        self._tx_cache = TTLCache(maxsize=1000, ttl=300)     # 交易缓存5分钟
+        
+        # 添加API请求限制
+        self._last_api_call = 0
+        self._min_api_interval = 0.1  # 最小API调用间隔（秒）
         
     def _get_result_file(self) -> pathlib.Path:
         """获取当天的结果文件路径"""
@@ -60,163 +96,54 @@ class TronEnergyFinder:
             "records": []
         }
         
-    def _save_results(self, addresses: List[Dict]):
-        """保存结果到文件"""
-        if not addresses:
-            return
+    async def _wait_for_api_limit(self):
+        """等待API限制"""
+        current_time = time.time()
+        if current_time - self._last_api_call < self._min_api_interval:
+            await asyncio.sleep(self._min_api_interval)
+        self._last_api_call = current_time
+        
+    async def _make_request(self, url: str, params: Dict) -> Optional[Dict]:
+        """带限制和重试机制的异步请求方法"""
+        async with self._api_lock:
+            await self._wait_for_api_limit()
             
-        # 加载当天的结果文件
-        results = self._load_existing_results()
-        
-        # 获取已存在的代理哈希集合
-        existing_proxy_hashes = {record["proxy_tx_hash"] for record in results["records"]}
-        
-        # 添加新记录
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        new_records = []
-        for addr in addresses:
-            if addr["proxy_tx_hash"] not in existing_proxy_hashes:
-                addr["found_time"] = current_time
-                new_records.append(addr)
-                existing_proxy_hashes.add(addr["proxy_tx_hash"])
-        
-        if new_records:
-            # 将新记录放在最前面
-            results["records"] = new_records + results["records"]
+            for attempt in range(self.retry_count):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params, headers=self.headers) as response:
+                            response.raise_for_status()
+                            return await response.json()
+                except Exception as e:
+                    if attempt == self.retry_count - 1:
+                        logger.error(f"请求失败 ({url}): {e}")
+                        return None
+                    logger.warning(f"请求失败，{self.retry_delay}秒后重试: {e}")
+                    await asyncio.sleep(self.retry_delay)
+            return None
             
-            # 保存到文件
-            result_file = self._get_result_file()
-            with open(result_file, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
-            
-            print(f"\n✅ 已保存 {len(new_records)} 个新记录到文件: {result_file}")
-        else:
-            print("\n📝 没有新的记录需要保存")
-        
-    def _make_request(self, url: str, params: Dict) -> Optional[Dict]:
-        """带重试机制的请求方法"""
-        for attempt in range(self.retry_count):
-            try:
-                response = requests.get(url, params=params, headers=self.headers)
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                if attempt == self.retry_count - 1:
-                    logger.error(f"请求失败 ({url}): {e}")
-                    return None
-                logger.warning(f"请求失败，{self.retry_delay}秒后重试: {e}")
-                time.sleep(self.retry_delay)
-        return None
-
-    def get_latest_block(self) -> Optional[int]:
+    async def get_latest_block(self) -> Optional[int]:
         """获取最新区块号"""
         try:
-            response = self._make_request(f"{self.tronscan_api}/block", {
+            response = await self._make_request(f"{self.tronscan_api}/block", {
                 "sort": "-number",
-                "limit": 1,
-                "count": True
+                "limit": "1",
+                "count": "true"
             })
             if response and "data" in response and response["data"]:
                 return response["data"][0]["number"]
             return None
         except Exception as e:
-            print(f"获取最新区块失败: {e}")
+            logger.error(f"获取最新区块失败: {e}")
             return None
 
-    def get_block_transactions(self, block_number: int) -> List[Dict]:
-        """获取区块交易详情"""
-        try:
-            print(f"正在获取区块 {block_number} 的交易信息...")
-            
-            # 使用 TronScan API 获取交易信息
-            response = self._make_request(f"{self.tronscan_api}/transaction", {
-                "block": block_number,
-                "limit": 1,
-                "start": 0,
-                "count": True
-            })
-            
-            if not response:
-                return []
-                
-            total_transactions = response.get("total", 0)
-            print(f"区块总交易数: {total_transactions}")
-            
-            # 分批获取所有交易
-            all_transactions = []
-            start = 0
-            limit = 200  # 每次获取200条
-            
-            while start < total_transactions:
-                response = self._make_request(f"{self.tronscan_api}/transaction", {
-                    "block": block_number,
-                    "limit": limit,
-                    "start": start,
-                    "count": True
-                })
-                
-                if not response or "data" not in response:
-                    break
-                    
-                transactions = response.get("data", [])
-                if not transactions:
-                    break
-                    
-                all_transactions.extend(transactions)
-                start += len(transactions)
-                print(f"已获取 {len(all_transactions)}/{total_transactions} 条交易记录")
-                time.sleep(0.5)  # 避免请求过快
-            
-            # 筛选代理资源交易
-            proxy_transactions = []
-            for tx in all_transactions:
-                # 检查合约类型和描述
-                contract_type = tx.get("contractType")
-                contract_data = tx.get("contractData", {})
-                
-                # 只检查代理资源交易 (Type 57)
-                if contract_type == 57:
-                    # 检查是否是能量代理
-                    if (contract_data.get("resource") == "ENERGY" and 
-                        "balance" in contract_data and 
-                        "receiver_address" in contract_data and 
-                        "owner_address" in contract_data):
-                        # 获取实际能量数量
-                        energy_amount = self.get_energy_amount(tx.get("hash"))
-                        
-                        if energy_amount is None:
-                            # 如果获取失败，使用合约数据计算
-                            staked_trx = float(contract_data.get("balance", 0)) / 1_000_000
-                            energy_amount = staked_trx * 11.3661
-                            energy_source = "计算值"
-                        else:
-                            energy_source = "API值"
-                        
-                        proxy_transactions.append(tx)
-                        print("\n找到代理资源交易:")
-                        print(f"交易哈希: {tx.get('hash')}")
-                        print(f"发送人: {contract_data.get('owner_address')}")
-                        print(f"接收人: {contract_data.get('receiver_address')}")
-                        print(f"代理数量: {energy_amount:,.2f} 能量")  # 格式化显示为中文
-                        
-            if proxy_transactions:
-                print(f"\n找到 {len(proxy_transactions)} 笔代理资源交易")
-            else:
-                print("\n未找到代理资源交易记录")
-                
-            return proxy_transactions
-            
-        except Exception as e:
-            print(f"获取区块交易详情失败: {e}")
-            return []
-
-    def get_transaction_info(self, tx_hash: str) -> Dict:
+    async def get_transaction_info(self, tx_hash: str) -> Dict:
         """获取交易详细信息（带缓存）"""
         if tx_hash in self._transaction_info_cache:
             return self._transaction_info_cache[tx_hash]
             
         try:
-            response = self._make_request(f"{self.tronscan_api}/transaction-info", {
+            response = await self._make_request(f"{self.tronscan_api}/transaction-info", {
                 "hash": tx_hash
             })
             if response:
@@ -226,12 +153,12 @@ class TronEnergyFinder:
             logger.error(f"获取交易详情失败: {e}")
             return {}
 
-    def get_energy_amount(self, tx_hash: str) -> Optional[float]:
+    async def get_energy_amount(self, tx_hash: str) -> Optional[float]:
         """获取交易中的实际能量数量（带缓存）"""
         if tx_hash in self._energy_amount_cache:
             return self._energy_amount_cache[tx_hash]
             
-        tx_info = self.get_transaction_info(tx_hash)
+        tx_info = await self.get_transaction_info(tx_hash)
         if tx_info and "contractData" in tx_info:
             contract_data = tx_info["contractData"]
             energy_amount = None
@@ -250,8 +177,8 @@ class TronEnergyFinder:
                 
         return None
 
-    def analyze_address(self, address: str) -> Optional[Dict]:
-        """分析地址的交易记录（带缓存）"""
+    async def analyze_address(self, address: str) -> Optional[Dict]:
+        """分析地址的交易记录"""
         # 检查是否已分析过
         if address in self._analyzed_addresses:
             return None
@@ -262,7 +189,7 @@ class TronEnergyFinder:
             logger.info(f"分析地址: {address}")
             
             # 获取地址的最近交易记录
-            response = self._make_request(f"{self.tronscan_api}/transaction", {
+            response = await self._make_request(f"{self.tronscan_api}/transaction", {
                 "address": address,
                 "limit": 50,
                 "sort": "-timestamp"
@@ -293,7 +220,7 @@ class TronEnergyFinder:
                                         trx_receiver = prev_tx.get("toAddress")
                                         
                                         # 获取收款地址的最近交易记录
-                                        receiver_response = self._make_request(
+                                        receiver_response = await self._make_request(
                                             f"{self.tronscan_api}/transaction",
                                             {
                                                 "address": trx_receiver,
@@ -308,6 +235,7 @@ class TronEnergyFinder:
                                         receiver_txs = receiver_response["data"]
                                         current_time = int(time.time() * 1000)
                                         amount_count = {}
+                                        total_count = 0
                                         
                                         # 分析收款地址的最近交易
                                         for rtx in receiver_txs:
@@ -321,9 +249,10 @@ class TronEnergyFinder:
                                                     rtx_amount = round(rtx_amount, 4)
                                                     if 0.1 <= rtx_amount <= 1:
                                                         amount_count[rtx_amount] = amount_count.get(rtx_amount, 0) + 1
+                                                        total_count += 1
                                                 except (ValueError, TypeError):
                                                     continue
-                                        
+                                                    
                                         # 检查交易数量
                                         max_count = max(amount_count.values()) if amount_count else 0
                                         max_amount = None
@@ -332,8 +261,10 @@ class TronEnergyFinder:
                                                 max_amount = amt
                                                 break
                                                 
-                                        if max_count >= 5 and sum(amount_count.values()) >= 20:
-                                            energy_amount = self.get_energy_amount(tx.get("hash"))
+                                        # 只在找到符合条件的交易时输出日志
+                                        if max_count >= 5 and total_count >= 20:
+                                            logger.info(f"地址 {trx_receiver} 24小时内总交易: {total_count}笔，最多重复金额: {max_count}笔")
+                                            energy_amount = await self.get_energy_amount(tx.get("hash"))
                                             
                                             if energy_amount is None:
                                                 staked_trx = float(contract_data.get("balance", 0)) / 1_000_000
@@ -352,7 +283,7 @@ class TronEnergyFinder:
                                                 "energy_source": energy_source,
                                                 "tx_hash": prev_tx.get("hash"),
                                                 "proxy_tx_hash": tx.get("hash"),
-                                                "recent_tx_count": sum(amount_count.values()),
+                                                "recent_tx_count": total_count,
                                                 "recent_tx_amount": max_amount,
                                                 "status": "正常使用"
                                             }
@@ -365,73 +296,57 @@ class TronEnergyFinder:
             logger.error(f"分析地址 {address} 时出错: {e}")
             return None
 
-    def find_low_cost_energy_addresses(self):
-        """查找低成本能量代理地址"""
-        try:
-            # 获取最新区块
-            latest_block = self.get_latest_block()
-            if not latest_block:
-                logger.error("获取最新区块失败")
-                return []
-                
-            logger.info(f"最新区块号: {latest_block}")
-            
-            # 初始化结果列表和计数器
-            found_addresses = []
-            current_block = latest_block
-            max_blocks_to_check = 1
-            blocks_checked = 0
-            
-            # 清空缓存
-            self._analyzed_addresses.clear()
-            self._energy_amount_cache.clear()
-            self._transaction_info_cache.clear()
-            
-            while blocks_checked < max_blocks_to_check:
-                logger.info(f"正在检查区块 {current_block}...")
-                
-                transactions = self.get_block_transactions(current_block)
-                
-                for tx in transactions:
-                    contract_data = tx.get("contractData", {})
-                    if (tx.get("contractType") == 57 and 
-                        contract_data.get("resource") == "ENERGY"):
-                        
-                        receiver_address = contract_data.get("receiver_address")
-                        if receiver_address:
-                            address_info = self.analyze_address(receiver_address)
-                            if address_info:
-                                found_addresses.append(address_info)
-                                self._save_results(found_addresses)
-                                self._print_results(found_addresses)
-                                return found_addresses
-                
-                current_block -= 1
-                blocks_checked += 1
-                
-            if not found_addresses:
-                logger.warning(f"检查了 {blocks_checked} 个区块后仍未找到符合条件的地址")
-            
-            return found_addresses
-            
-        except Exception as e:
-            logger.error(f"查找低成本能量代理地址时发生错误: {e}")
-            return []
-
-    def _print_results(self, addresses):
-        """格式化输出结果"""
+    async def _save_results(self, addresses: List[Dict]):
+        """保存结果到文件"""
         if not addresses:
-            print("\n❌ 未找到符合条件的低价能量地址")
             return
             
-        print("\n🎉 找到以下低价能量地址：\n")
+        try:
+            # 加载当天的结果文件
+            results = self._load_existing_results()
+            
+            # 获取已存在的代理哈希集合
+            existing_proxy_hashes = {record["proxy_tx_hash"] for record in results["records"]}
+            
+            # 添加新记录
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            new_records = []
+            for addr in addresses:
+                if addr["proxy_tx_hash"] not in existing_proxy_hashes:
+                    addr["found_time"] = current_time
+                    new_records.append(addr)
+                    existing_proxy_hashes.add(addr["proxy_tx_hash"])
+            
+            if new_records:
+                # 将新记录放在最前面
+                results["records"] = new_records + results["records"]
+                
+                # 保存到文件
+                result_file = self._get_result_file()
+                with open(result_file, "w", encoding="utf-8") as f:
+                    json.dump(results, f, ensure_ascii=False, indent=2)
+                
+                logger.info(f"已保存 {len(new_records)} 个新记录到文件: {result_file}")
+            else:
+                logger.info("没有新的记录需要保存")
+                
+        except Exception as e:
+            logger.error(f"保存结果时出错: {e}")
+
+    async def _print_results(self, addresses):
+        """格式化输出结果"""
+        if not addresses:
+            logger.warning("未找到符合条件的低价能量地址")
+            return
+            
+        result_text = "\n🎉 找到以下低价能量地址：\n\n"
         for addr in addresses:
             # 如果是计算值，添加提示信息
             energy_display = addr['energy_quantity']
             if addr['energy_source'] == "计算值":
                 energy_display = f"{energy_display} (计算值，仅供参考)"
                 
-            print(f"""🔹 【收款地址】: {addr['address']}
+            result_text += f"""🔹 【收款地址】: {addr['address']}
 🔹 【能量提供方】: {addr['energy_provider']}
 🔹 【购买记录】: https://tronscan.org/#/address/{addr['address']}
 🔹 【收款金额】: {addr['purchase_amount']} TRX
@@ -441,16 +356,180 @@ class TronEnergyFinder:
 🔹 【代理哈希】: {addr['proxy_tx_hash']}
 
 【地址信息】{addr['status']}
-""")
+"""
+        logger.info(result_text)
 
-def main():
-    # 检查API Key
-    if not os.getenv("TRON_API_KEY"):
-        print("警告: 未设置TRON_API_KEY环境变量，TronScan API访问可能受限")
-        print("请在.env文件中设置TRON_API_KEY=你的TronScan API密钥")
-    
-    finder = TronEnergyFinder()
-    finder.find_low_cost_energy_addresses()
+    async def get_block_transactions(self, block_number: int) -> List[Dict]:
+        """获取区块交易详情"""
+        try:
+            cache_key = f"block_{block_number}"
+            
+            # 检查缓存
+            if cache_key in self._block_cache:
+                logger.debug(f"使用缓存的区块 {block_number} 交易数据")
+                return self._block_cache[cache_key]
+            
+            # 使用 TronScan API 获取交易信息
+            response = await self._make_request(f"{self.tronscan_api}/transaction", {
+                "block": str(block_number),
+                "limit": "1",
+                "start": "0",
+                "count": "true"
+            })
+            
+            if not response:
+                return []
+                
+            total_transactions = response.get("total", 0)
+            logger.info(f"正在检查区块 {block_number}，总交易数: {total_transactions}")
+            
+            # 分批获取所有交易
+            all_transactions = []
+            start = 0
+            limit = 200  # 每次获取200条
+            
+            while start < total_transactions:
+                response = await self._make_request(f"{self.tronscan_api}/transaction", {
+                    "block": str(block_number),
+                    "limit": str(limit),
+                    "start": str(start),
+                    "count": "true"
+                })
+                
+                if not response or "data" not in response:
+                    break
+                    
+                transactions = response.get("data", [])
+                if not transactions:
+                    break
+                    
+                all_transactions.extend(transactions)
+                start += len(transactions)
+                logger.debug(f"已获取 {len(all_transactions)}/{total_transactions} 条交易记录")
+                await asyncio.sleep(0.5)  # 避免请求过快
+            
+            # 筛选代理资源交易
+            proxy_transactions = []
+            for tx in all_transactions:
+                # 检查合约类型和描述
+                contract_type = tx.get("contractType")
+                contract_data = tx.get("contractData", {})
+                
+                # 只检查代理资源交易 (Type 57)
+                if contract_type == 57:
+                    # 检查是否是能量代理
+                    if (contract_data.get("resource") == "ENERGY" and 
+                        "balance" in contract_data and 
+                        "receiver_address" in contract_data and 
+                        "owner_address" in contract_data):
+                        
+                        proxy_transactions.append(tx)
+            
+            if proxy_transactions:
+                logger.info(f"区块 {block_number} 找到 {len(proxy_transactions)} 笔代理资源交易")
+                # 缓存结果
+                self._block_cache[cache_key] = proxy_transactions
+            else:
+                logger.debug(f"区块 {block_number} 未找到代理资源交易记录")
+                
+            return proxy_transactions
+            
+        except Exception as e:
+            logger.error(f"获取区块交易详情失败: {e}")
+            return []
+
+    async def find_low_cost_energy_addresses(self):
+        """查找低成本能量代理地址（带缓存和并发控制）"""
+        cache_key = "latest_results"
+        
+        # 检查缓存
+        if cache_key in self._results_cache:
+            logger.info("使用缓存的结果")
+            return self._results_cache[cache_key]
+            
+        try:
+            # 获取最新区块
+            latest_block = await self.get_latest_block()
+            if not latest_block:
+                logger.error("获取最新区块失败")
+                return []
+                
+            logger.info(f"最新区块号: {latest_block}")
+            
+            # 初始化结果列表和计数器
+            found_addresses = []
+            current_block = latest_block
+            max_blocks_to_check = 3  # 最多检查3个区块
+            blocks_checked = 0
+            
+            # 清空缓存
+            async with self._cache_lock:
+                self._analyzed_addresses.clear()
+                self._energy_amount_cache.clear()
+                self._transaction_info_cache.clear()
+            
+            while blocks_checked < max_blocks_to_check:
+                logger.info(f"正在检查区块 {current_block}...")
+                
+                transactions = await self.get_block_transactions(current_block)
+                if not transactions:
+                    logger.warning(f"区块 {current_block} 没有交易")
+                    current_block -= 1
+                    blocks_checked += 1
+                    continue
+                    
+                logger.info(f"区块 {current_block} 有 {len(transactions)} 笔交易")
+                proxy_count = 0
+                
+                # 分析每个代理交易
+                for tx in transactions:
+                    contract_data = tx.get("contractData", {})
+                    if (tx.get("contractType") == 57 and 
+                        contract_data.get("resource") == "ENERGY"):
+                        
+                        proxy_count += 1
+                        logger.info(f"找到代理资源交易:\n"
+                                  f"交易哈希: {tx.get('hash')}\n"
+                                  f"发送人: {contract_data.get('owner_address')}\n"
+                                  f"接收人: {contract_data.get('receiver_address')}\n"
+                                  f"代理数量: {contract_data.get('balance', 0) / 1_000_000 * 11.3661:,.2f} 能量")
+                        
+                        receiver_address = contract_data.get("receiver_address")
+                        if receiver_address:
+                            address_info = await self.analyze_address(receiver_address)
+                            if address_info:
+                                # 找到符合条件的地址，保存到缓存并返回
+                                found_addresses.append(address_info)
+                                self._results_cache[cache_key] = found_addresses
+                                await self._save_results(found_addresses)
+                                await self._print_results(found_addresses)
+                                logger.info("✅ 已找到符合条件的地址，停止查找")
+                                return found_addresses
+                
+                logger.info(f"区块 {current_block} 检查完成，找到 {proxy_count} 笔代理资源交易")
+                current_block -= 1
+                blocks_checked += 1
+                
+            if not found_addresses:
+                logger.warning(f"检查了 {blocks_checked} 个区块后仍未找到符合条件的地址")
+                # 缓存空结果，避免频繁查询
+                self._results_cache[cache_key] = found_addresses
+            
+            return found_addresses
+            
+        except Exception as e:
+            logger.error(f"查找低成本能量代理地址时发生错误: {e}")
+            return []
+
+async def main():
+    """主函数"""
+    try:
+        finder = TronEnergyFinder()
+        await finder.find_low_cost_energy_addresses()
+        
+    except Exception as e:
+        logger.error(f"运行出错: {e}")
+        raise
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main()) 

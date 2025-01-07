@@ -29,3 +29,6 @@ Thumbs.db
 # Backup files
 *~
 *.bak
+
+results/
+myenv/
