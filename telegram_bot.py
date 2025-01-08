@@ -237,8 +237,8 @@ class TronEnergyBot:
             f"🔹 【24h交易数】: {addr['recent_tx_count']} 笔\n"
             f"🔹 【转账哈希】: `{addr['tx_hash']}`\n"
             f"🔹 【代理哈希】: `{addr['proxy_tx_hash']}`\n\n"
-            f"🔹 【地址状态】{addr['status']}\n\n"
-            f"🔹 #{addr['purchase_amount']}"  # 添加金额标签
+            f"🎊 【地址状态】{addr['status']}\n\n"
+            f"🈹 TRX #{addr['purchase_amount']}"  # 添加金额标签
         )
 
         # 如果配置了广告内容，添加到消息末尾
