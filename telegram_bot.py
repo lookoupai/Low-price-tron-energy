@@ -45,6 +45,11 @@ class TronEnergyBot:
             token_preview = self.token[:8] + "*" * (len(self.token) - 8)
             logger.info(f"成功加载 TELEGRAM_BOT_TOKEN: {token_preview}")
             
+        # 获取广告内容
+        self.advertisement = os.getenv("BOT_ADVERTISEMENT", "").strip()
+        if self.advertisement:
+            logger.info("成功加载广告内容")
+            
         # 初始化TronEnergyFinder
         self.finder = TronEnergyFinder()
         
@@ -223,7 +228,7 @@ class TronEnergyBot:
         if addr['energy_source'] == "计算值":
             energy_display = f"{energy_display} (计算值，仅供参考)"
             
-        return (
+        message = (
             f"🔹 【收款地址】: `{addr['address']}`\n"
             f"🔹 【能量提供方】: `{addr['energy_provider']}`\n"
             f"🔹 【购买记录】: [查看](https://tronscan.org/#/address/{addr['address']})\n"
@@ -232,8 +237,15 @@ class TronEnergyBot:
             f"🔹 【24h交易数】: {addr['recent_tx_count']} 笔\n"
             f"🔹 【转账哈希】: `{addr['tx_hash']}`\n"
             f"🔹 【代理哈希】: `{addr['proxy_tx_hash']}`\n\n"
-            f"【地址状态】{addr['status']}"
+            f"🔹 【地址状态】{addr['status']}\n\n"
+            f"🔹 #{addr['purchase_amount']}"  # 添加金额标签
         )
+
+        # 如果配置了广告内容，添加到消息末尾
+        if self.advertisement:
+            message += f"\n\n{self.advertisement}"
+            
+        return message
         
     async def _check_user_cooldown(self, user_id: int) -> bool:
         """检查用户是否在冷却时间内"""
