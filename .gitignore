@@ -30,5 +30,13 @@ Thumbs.db
 *~
 *.bak
 
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
 results/
 myenv/
+venv/
