@@ -84,6 +84,10 @@ class BlacklistManager:
             if not self._validate_tron_address(address):
                 return False
                 
+            # 确保数据库连接池已初始化
+            if self._connection_pool is None:
+                await self.init_database()
+                
             async with self._connection_pool.acquire() as connection:
                 await connection.execute('''
                     INSERT INTO blacklist (address, reason, type, added_by)
@@ -116,6 +120,10 @@ class BlacklistManager:
             if not self._validate_tron_address(address):
                 return None
                 
+            # 确保数据库连接池已初始化
+            if self._connection_pool is None:
+                await self.init_database()
+                
             async with self._connection_pool.acquire() as connection:
                 result = await connection.fetchrow('''
                     SELECT address, reason, type, added_by, added_at, is_active
@@ -147,6 +155,10 @@ class BlacklistManager:
     async def remove_from_blacklist(self, address: str) -> bool:
         """从黑名单中移除地址"""
         try:
+            # 确保数据库连接池已初始化
+            if self._connection_pool is None:
+                await self.init_database()
+                
             async with self._connection_pool.acquire() as connection:
                 result = await connection.execute('''
                     UPDATE blacklist 
@@ -167,6 +179,10 @@ class BlacklistManager:
     async def add_association(self, source_address: str, target_address: str) -> bool:
         """添加地址关联记录"""
         try:
+            # 确保数据库连接池已初始化
+            if self._connection_pool is None:
+                await self.init_database()
+                
             async with self._connection_pool.acquire() as connection:
                 await connection.execute('''
                     INSERT INTO blacklist_associations (source_address, target_address)
@@ -217,6 +233,10 @@ class BlacklistManager:
     async def get_blacklist_stats(self) -> Dict:
         """获取黑名单统计信息"""
         try:
+            # 确保数据库连接池已初始化
+            if self._connection_pool is None:
+                await self.init_database()
+                
             async with self._connection_pool.acquire() as connection:
                 result = await connection.fetchrow('''
                     SELECT 
