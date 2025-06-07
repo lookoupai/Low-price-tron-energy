@@ -131,6 +131,64 @@ class TronEnergyFinder:
         self._last_api_call = 0
         self._min_api_interval = 0.1  # 最小API调用间隔（秒）
         
+        # 黑名单管理器（延迟初始化）
+        self._blacklist_manager = None
+        
+    async def init_blacklist_manager(self):
+        """初始化黑名单管理器"""
+        if self._blacklist_manager is None:
+            try:
+                from blacklist_manager import BlacklistManager
+                self._blacklist_manager = BlacklistManager()
+                await self._blacklist_manager.init_database()
+                logger.info("黑名单管理器初始化成功")
+            except Exception as e:
+                logger.warning(f"黑名单管理器初始化失败: {e}")
+                self._blacklist_manager = None
+                
+    async def check_and_handle_blacklist(self, payment_address: str, energy_provider: str) -> Dict:
+        """检查黑名单并处理自动关联"""
+        result = {
+            'payment_blacklisted': False,
+            'provider_blacklisted': False,
+            'blacklist_warning': '',
+            'auto_associated': False
+        }
+        
+        try:
+            if self._blacklist_manager is None:
+                await self.init_blacklist_manager()
+            
+            if self._blacklist_manager is None:
+                return result
+                
+            # 检查收款地址
+            payment_info = await self._blacklist_manager.check_blacklist(payment_address)
+            if payment_info:
+                result['payment_blacklisted'] = True
+                result['blacklist_warning'] += f"⚠️ 收款地址已列入黑名单: {payment_info.get('reason', '未提供原因')}\n"
+                
+            # 检查能量提供方
+            provider_info = await self._blacklist_manager.check_blacklist(energy_provider)
+            if provider_info:
+                result['provider_blacklisted'] = True
+                result['blacklist_warning'] += f"⚠️ 能量提供方已列入黑名单: {provider_info.get('reason', '未提供原因')}\n"
+                
+            # 自动关联逻辑
+            if result['payment_blacklisted'] or result['provider_blacklisted']:
+                success = await self._blacklist_manager.auto_associate_addresses(payment_address, energy_provider)
+                if success:
+                    result['auto_associated'] = True
+                    result['blacklist_warning'] += "🔗 已自动关联相关地址到黑名单\n"
+                    
+                # 添加风险警告
+                result['blacklist_warning'] += "💡 此地址已被提交黑名单，有白名单限制，直接转TRX可能无法获得能量！"
+                
+        except Exception as e:
+            logger.error(f"黑名单检查失败: {e}")
+            
+        return result
+        
     def _get_result_file(self) -> pathlib.Path:
         """获取当天的结果文件路径"""
         today = datetime.now().strftime("%Y-%m-%d")
@@ -332,7 +390,11 @@ class TronEnergyFinder:
                                             else:
                                                 energy_source = "API值"
                                                 
-                                            return {
+                                            # 执行黑名单检查
+                                            blacklist_result = await self.check_and_handle_blacklist(trx_receiver, energy_provider)
+                                            
+                                            # 构建基础结果
+                                            result = {
                                                 "address": trx_receiver,
                                                 "energy_provider": energy_provider,
                                                 "purchase_amount": max_amount,
@@ -342,8 +404,18 @@ class TronEnergyFinder:
                                                 "proxy_tx_hash": tx.get("hash"),
                                                 "recent_tx_count": total_count,
                                                 "recent_tx_amount": max_amount,
-                                                "status": "正常使用"  # 直接使用"正常使用"状态
+                                                "status": "正常使用"
                                             }
+                                            
+                                            # 添加黑名单相关信息
+                                            result.update({
+                                                "payment_blacklisted": blacklist_result['payment_blacklisted'],
+                                                "provider_blacklisted": blacklist_result['provider_blacklisted'],
+                                                "blacklist_warning": blacklist_result['blacklist_warning'],
+                                                "auto_associated": blacklist_result['auto_associated']
+                                            })
+                                            
+                                            return result
                                 except (ValueError, TypeError):
                                     continue
             

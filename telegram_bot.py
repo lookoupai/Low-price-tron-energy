@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Set
 import asyncio
 import time
+import re
 
 from telegram import Update
 from telegram.ext import (
@@ -20,6 +21,7 @@ from functools import lru_cache
 from cachetools import TTLCache
 
 from tron_energy_finder import TronEnergyFinder
+from blacklist_manager import BlacklistManager
 
 # 配置日志
 logging.basicConfig(
@@ -53,6 +55,9 @@ class TronEnergyBot:
         # 初始化TronEnergyFinder
         self.finder = TronEnergyFinder()
         
+        # 初始化黑名单管理器
+        self.blacklist_manager = BlacklistManager()
+        
         # 初始化调度器
         self.scheduler = AsyncIOScheduler()
         
@@ -64,6 +69,9 @@ class TronEnergyBot:
         self._query_semaphore = asyncio.Semaphore(3)  # 最多同时处理3个查询
         self._user_cooldowns = TTLCache(maxsize=1000, ttl=60)  # 用户冷却时间缓存
         self._min_query_interval = 60  # 用户查询间隔（秒）
+        
+        # TRON地址检测正则表达式
+        self.tron_address_pattern = re.compile(r'\b(T[1-9A-HJ-NP-Za-km-z]{33})\b')
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理/start命令"""
@@ -198,6 +206,166 @@ class TronEnergyBot:
         except Exception as e:
             logger.error(f"处理 stop_push 命令时出错: {e}")
             await self._handle_error(update, context, str(e))
+            
+    async def blacklist_add_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """添加地址到黑名单"""
+        try:
+            # 检查参数
+            if not context.args:
+                await update.message.reply_text("❌ 请提供地址参数\n\n使用方法: `/blacklist_add <地址> [原因]`", parse_mode='Markdown')
+                return
+                
+            address = context.args[0]
+            reason = " ".join(context.args[1:]) if len(context.args) > 1 else f"用户 {update.effective_user.id} 举报"
+            
+            # 验证地址格式
+            if not self.blacklist_manager._validate_tron_address(address):
+                await update.message.reply_text("❌ 无效的TRON地址格式")
+                return
+                
+            # 初始化黑名单管理器
+            if self.blacklist_manager._connection_pool is None:
+                await self.blacklist_manager.init_database()
+                
+            # 添加到黑名单
+            success = await self.blacklist_manager.add_to_blacklist(
+                address, reason, update.effective_user.id
+            )
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ 地址已添加到黑名单\n\n"
+                    f"📍 **地址**: `{address}`\n"
+                    f"📝 **原因**: {reason}\n"
+                    f"👤 **提交者**: {update.effective_user.id}",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text("❌ 添加失败，请检查地址格式或稍后重试")
+                
+        except Exception as e:
+            logger.error(f"添加黑名单命令出错: {e}")
+            await self._handle_error(update, context, str(e))
+            
+    async def blacklist_check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """查询地址黑名单状态"""
+        try:
+            # 检查参数
+            if not context.args:
+                await update.message.reply_text("❌ 请提供地址参数\n\n使用方法: `/blacklist_check <地址>`", parse_mode='Markdown')
+                return
+                
+            address = context.args[0]
+            
+            # 验证地址格式
+            if not self.blacklist_manager._validate_tron_address(address):
+                await update.message.reply_text("❌ 无效的TRON地址格式")
+                return
+                
+            # 初始化黑名单管理器
+            if self.blacklist_manager._connection_pool is None:
+                await self.blacklist_manager.init_database()
+                
+            # 检查黑名单
+            blacklist_info = await self.blacklist_manager.check_blacklist(address)
+            
+            if blacklist_info:
+                added_time = blacklist_info['added_at'].strftime("%Y-%m-%d %H:%M:%S") if blacklist_info['added_at'] else "未知"
+                
+                message = f"""🔍 **黑名单查询结果**
+
+📍 **地址**: `{address}`
+
+❌ **状态**: 已列入黑名单
+📝 **原因**: {blacklist_info['reason'] or '未提供原因'}
+⏰ **添加时间**: {added_time}
+🔖 **类型**: {'手动添加' if blacklist_info['type'] == 'manual' else '自动关联'}
+👤 **添加者**: {blacklist_info['added_by'] or '未知'}
+
+⚠️ **风险提醒**: 此地址可能存在白名单限制，直接转TRX可能无法获得能量！"""
+            else:
+                message = f"""🔍 **黑名单查询结果**
+
+📍 **地址**: `{address}`
+
+✅ **状态**: 未列入黑名单
+💡 **提示**: 该地址目前没有被举报"""
+                
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"查询黑名单命令出错: {e}")
+            await self._handle_error(update, context, str(e))
+            
+    async def blacklist_remove_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """从黑名单中移除地址（仅管理员）"""
+        try:
+            # 检查管理员权限
+            if not await self.check_admin_rights(update, context):
+                await update.message.reply_text("❌ 您没有权限执行此操作，只有管理员可以移除黑名单")
+                return
+                
+            # 检查参数
+            if not context.args:
+                await update.message.reply_text("❌ 请提供地址参数\n\n使用方法: `/blacklist_remove <地址>`", parse_mode='Markdown')
+                return
+                
+            address = context.args[0]
+            
+            # 验证地址格式
+            if not self.blacklist_manager._validate_tron_address(address):
+                await update.message.reply_text("❌ 无效的TRON地址格式")
+                return
+                
+            # 初始化黑名单管理器
+            if self.blacklist_manager._connection_pool is None:
+                await self.blacklist_manager.init_database()
+                
+            # 从黑名单中移除
+            success = await self.blacklist_manager.remove_from_blacklist(address)
+            
+            if success:
+                await update.message.reply_text(
+                    f"✅ 地址已从黑名单中移除\n\n"
+                    f"📍 **地址**: `{address}`\n"
+                    f"👤 **操作者**: {update.effective_user.id}",
+                    parse_mode='Markdown'
+                )
+            else:
+                await update.message.reply_text("❌ 移除失败，请稍后重试")
+                
+        except Exception as e:
+            logger.error(f"移除黑名单命令出错: {e}")
+            await self._handle_error(update, context, str(e))
+            
+    async def blacklist_stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """查看黑名单统计信息"""
+        try:
+            # 初始化黑名单管理器
+            if self.blacklist_manager._connection_pool is None:
+                await self.blacklist_manager.init_database()
+                
+            # 获取统计信息
+            stats = await self.blacklist_manager.get_blacklist_stats()
+            
+            if stats:
+                message = f"""📊 **黑名单统计信息**
+
+📈 **总数量**: {stats.get('total', 0)} 个地址
+👤 **手动添加**: {stats.get('manual', 0)} 个地址
+🔗 **自动关联**: {stats.get('auto_associated', 0)} 个地址
+
+💡 **说明**: 
+- 手动添加：用户主动举报的地址
+- 自动关联：系统检测到与黑名单地址有关联的地址"""
+            else:
+                message = "📊 **黑名单统计信息**\n\n暂无统计数据"
+                
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"查看黑名单统计出错: {e}")
+            await self._handle_error(update, context, str(e))
 
     async def send_message_to_chat(self, chat_id: int, text: str, **kwargs) -> None:
         """发送消息到指定聊天"""
@@ -238,8 +406,13 @@ class TronEnergyBot:
             f"🔹 【转账哈希】: `{addr['tx_hash']}`\n"
             f"🔹 【代理哈希】: `{addr['proxy_tx_hash']}`\n\n"
             f"🎊 【地址状态】{addr['status']}\n\n"
-            f"🈹 TRX #{addr['purchase_amount']}"  # 添加金额标签
         )
+        
+        # 检查并添加黑名单警告
+        if addr.get('blacklist_warning'):
+            message += f"⚠️ **黑名单警告**:\n{addr['blacklist_warning']}\n\n"
+            
+        message += f"🈹 TRX #{addr['purchase_amount']}"  # 添加金额标签
 
         # 如果配置了广告内容，添加到消息末尾
         if self.advertisement:
@@ -439,10 +612,22 @@ class TronEnergyBot:
                 filters.ChatType.CHANNEL | filters.ChatType.GROUPS | filters.ChatType.PRIVATE
             ))
             
+            # 添加黑名单相关命令处理器
+            self.application.add_handler(CommandHandler("blacklist_add", self.blacklist_add_command))
+            self.application.add_handler(CommandHandler("blacklist_check", self.blacklist_check_command))
+            self.application.add_handler(CommandHandler("blacklist_remove", self.blacklist_remove_command))
+            self.application.add_handler(CommandHandler("blacklist_stats", self.blacklist_stats_command))
+            
             # 添加新成员处理器
             self.application.add_handler(MessageHandler(
                 filters.StatusUpdate.NEW_CHAT_MEMBERS,
                 self.handle_new_chat_members
+            ))
+            
+            # 添加地址检查处理器 - 监听所有文本消息
+            self.application.add_handler(MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self.address_check_handler
             ))
             
             # 添加错误处理器
@@ -467,6 +652,61 @@ class TronEnergyBot:
         except Exception as e:
             logger.error(f"启动机器人时出错: {e}")
             raise
+
+    async def address_check_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理用户发送的TRON地址，自动检查黑名单"""
+        try:
+            message = update.message
+            if not message or not message.text:
+                return
+                
+            # 检测消息中的TRON地址
+            addresses = self.tron_address_pattern.findall(message.text)
+            if not addresses:
+                return
+                
+            # 去重
+            unique_addresses = list(set(addresses))
+            
+            for address in unique_addresses:
+                # 检查黑名单
+                blacklist_info = await self.blacklist_manager.check_blacklist(address)
+                
+                if blacklist_info:
+                    # 地址在黑名单中，发送警告
+                    await self._send_blacklist_warning(message, address, blacklist_info)
+                
+        except Exception as e:
+            logger.error(f"地址检查处理失败: {e}")
+            
+    async def _send_blacklist_warning(self, message, address: str, blacklist_info: Dict) -> None:
+        """发送黑名单警告消息"""
+        try:
+            # 格式化添加时间
+            added_time = blacklist_info['added_at'].strftime("%Y-%m-%d %H:%M:%S") if blacklist_info['added_at'] else "未知"
+            
+            # 构建警告消息
+            warning_message = f"""🔍 **地址查询结果**
+
+📍 **地址**: `{address}`
+
+❌ **黑名单状态**: 已列入黑名单
+⚠️ **风险提醒**: 此地址已被用户举报，可能存在白名单限制
+📝 **举报原因**: {blacklist_info['reason'] or '未提供原因'}
+⏰ **添加时间**: {added_time}
+🔖 **添加类型**: {'手动添加' if blacklist_info['type'] == 'manual' else '自动关联'}
+
+💡 **建议**: 直接转TRX可能无法获得能量，请谨慎操作！
+
+如有疑问，请联系管理员。"""
+
+            await message.reply_text(warning_message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"发送黑名单警告失败: {e}")
+            # 发送简化版本
+            simple_warning = f"⚠️ 警告：地址 {address} 已被列入黑名单，可能存在白名单限制！"
+            await message.reply_text(simple_warning)
 
     async def _handle_error(self, update: Update, context: ContextTypes.DEFAULT_TYPE, error_message: str) -> None:
         """统一的错误处理方法"""

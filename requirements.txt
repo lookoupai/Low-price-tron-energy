@@ -4,4 +4,6 @@ requests==2.31.0
 APScheduler==3.10.4
 tqdm==4.66.1
 cachetools==5.3.2
-aiohttp==3.9.1 
+aiohttp==3.9.1
+psycopg2-binary==2.9.9
+asyncpg==0.29.0 
