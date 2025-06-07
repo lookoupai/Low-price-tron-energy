@@ -93,7 +93,17 @@ class TronEnergyBot:
             "   /start_push - 开启定时推送（仅管理员）\n"
             "   /stop_push - 关闭定时推送（仅管理员）\n"
             "   /query - 立即查询一次\n\n"
-            "注意：在频道/群组中使用命令需要授予机器人管理员权限"
+            "3️⃣ 黑名单功能：\n"
+            "   /blacklist_add <地址> [原因] - 添加地址到黑名单\n"
+            "   /blacklist_check <地址> - 查询地址黑名单状态\n"
+            "   /blacklist_remove <地址> - 从黑名单移除地址（仅管理员）\n"
+            "   /blacklist_stats - 查看黑名单统计信息\n\n"
+            "4️⃣ 地址检测：\n"
+            "   直接发送TRON地址自动检查黑名单状态\n\n"
+            "💡 注意事项：\n"
+            "   • 频道/群组中使用命令需要授予机器人管理员权限\n"
+            "   • 查询结果中会显示黑名单警告信息\n"
+            "   • 发现可疑地址请及时举报到黑名单"
         )
         await update.message.reply_text(help_message)
         
