@@ -116,6 +116,12 @@ class TronEnergyFinder:
         self.results_dir = pathlib.Path("results")
         self.results_dir.mkdir(exist_ok=True)
         
+        # 文件清理配置
+        self.cleanup_enabled = True              # 是否启用自动清理
+        self.retention_days = 7                  # 保留天数（默认7天）
+        self.max_cleanup_files = 100            # 单次最大清理文件数（防止意外删除过多文件）
+        self.last_cleanup_date = None           # 记录最后清理的日期，避免同一天重复清理
+        
         # 初始化缓存
         self._block_cache = {}  # 区块缓存
         self._analyzed_addresses = set()  # 已分析的地址集合
@@ -193,6 +199,129 @@ class TronEnergyFinder:
         """获取当天的结果文件路径"""
         today = datetime.now().strftime("%Y-%m-%d")
         return self.results_dir / f"energy_addresses_{today}.json"
+        
+    def _get_file_date_from_name(self, filename: str) -> Optional[datetime]:
+        """从文件名中解析日期"""
+        try:
+            # 解析格式：energy_addresses_YYYY-MM-DD.json
+            if not filename.startswith("energy_addresses_") or not filename.endswith(".json"):
+                return None
+            
+            # 提取日期部分
+            date_part = filename[len("energy_addresses_"):-len(".json")]
+            
+            # 验证日期格式 YYYY-MM-DD
+            if len(date_part) != 10 or date_part[4] != '-' or date_part[7] != '-':
+                return None
+                
+            # 解析日期
+            return datetime.strptime(date_part, "%Y-%m-%d")
+            
+        except (ValueError, IndexError) as e:
+            logger.debug(f"无法解析文件名中的日期 '{filename}': {e}")
+            return None
+            
+    async def _cleanup_old_files(self) -> int:
+        """清理过期的结果文件"""
+        if not self.cleanup_enabled:
+            return 0
+            
+        try:
+            # 检查是否今天已经清理过
+            today = datetime.now().date()
+            if self.last_cleanup_date == today:
+                logger.debug(f"今天 ({today}) 已经执行过清理，跳过重复清理")
+                return 0
+            
+            # 计算截止日期
+            cutoff_date = datetime.now() - timedelta(days=self.retention_days)
+            logger.debug(f"开始清理 {cutoff_date.strftime('%Y-%m-%d')} 之前的结果文件")
+            
+            # 扫描results目录
+            if not self.results_dir.exists():
+                return 0
+                
+            files_to_delete = []
+            
+            # 遍历目录中的所有文件
+            for file_path in self.results_dir.iterdir():
+                if not file_path.is_file():
+                    continue
+                    
+                filename = file_path.name
+                file_date = self._get_file_date_from_name(filename)
+                
+                # 如果无法解析日期或文件不是结果文件格式，跳过
+                if file_date is None:
+                    continue
+                    
+                # 检查是否过期
+                if file_date < cutoff_date:
+                    files_to_delete.append(file_path)
+                    
+                # 防止单次删除过多文件
+                if len(files_to_delete) >= self.max_cleanup_files:
+                    logger.warning(f"达到单次清理文件数限制 ({self.max_cleanup_files})，停止扫描")
+                    break
+            
+            # 执行删除操作
+            deleted_count = 0
+            for file_path in files_to_delete:
+                try:
+                    file_path.unlink()  # 删除文件
+                    deleted_count += 1
+                    logger.debug(f"已删除过期文件: {file_path.name}")
+                except OSError as e:
+                    logger.error(f"删除文件失败 {file_path.name}: {e}")
+                    
+            if deleted_count > 0:
+                logger.info(f"清理完成：删除了 {deleted_count} 个过期的结果文件（保留最近 {self.retention_days} 天）")
+            else:
+                logger.debug("没有找到需要清理的过期文件")
+            
+            # 更新最后清理日期
+            self.last_cleanup_date = today
+            logger.debug(f"更新最后清理日期为: {today}")
+                
+            return deleted_count
+            
+        except Exception as e:
+            logger.error(f"文件清理过程中发生错误: {e}")
+            return 0
+            
+    async def cleanup_results_manually(self, retention_days: Optional[int] = None) -> int:
+        """手动清理结果文件
+        
+        Args:
+            retention_days: 保留天数，如果为None则使用默认配置
+            
+        Returns:
+            int: 清理的文件数量
+        """
+        # 临时保存原始配置
+        original_enabled = self.cleanup_enabled
+        original_retention_days = self.retention_days
+        
+        try:
+            # 启用清理并设置保留天数
+            self.cleanup_enabled = True
+            if retention_days is not None:
+                self.retention_days = retention_days
+                
+            logger.info(f"开始手动清理结果文件（保留最近 {self.retention_days} 天）")
+            cleaned_count = await self._cleanup_old_files()
+            
+            if cleaned_count > 0:
+                logger.info(f"手动清理完成：删除了 {cleaned_count} 个过期文件")
+            else:
+                logger.info("手动清理完成：没有找到需要清理的文件")
+                
+            return cleaned_count
+            
+        finally:
+            # 恢复原始配置
+            self.cleanup_enabled = original_enabled
+            self.retention_days = original_retention_days
         
     def _load_existing_results(self) -> Dict:
         """加载已有的结果"""
@@ -458,6 +587,15 @@ class TronEnergyFinder:
                 logger.info(f"已保存 {len(new_records)} 个新记录到文件: {result_file}")
             else:
                 logger.info("没有新的记录需要保存")
+            
+            # 执行自动清理（如果启用）
+            if self.cleanup_enabled:
+                try:
+                    cleaned_count = await self._cleanup_old_files()
+                    if cleaned_count > 0:
+                        logger.info(f"自动清理了 {cleaned_count} 个过期结果文件")
+                except Exception as e:
+                    logger.error(f"自动清理失败: {e}")
                 
         except Exception as e:
             logger.error(f"保存结果时出错: {e}")

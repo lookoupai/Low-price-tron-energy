@@ -390,6 +390,14 @@ class TronEnergyBot:
         except Exception as e:
             logger.error(f"发送错误消息失败: {e}")
 
+    def _escape_markdown(self, text: str) -> str:
+        """转义 Markdown 特殊字符"""
+        # 转义 Markdown 中的特殊字符
+        special_chars = ['<', '>', '[', ']', '(', ')', '*', '_', '`', '~']
+        for char in special_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
+
     def format_address_info(self, addr: Dict) -> str:
         """格式化地址信息为消息文本"""
         energy_display = addr['energy_quantity']
@@ -416,7 +424,10 @@ class TronEnergyBot:
 
         # 如果配置了广告内容，添加到消息末尾
         if self.advertisement:
-            message += f"\n\n{self.advertisement}"
+            # 对于广告内容，我们使用 HTML 模式发送，避免 Markdown 解析问题
+            # 但这里先简单替换最常见的问题字符
+            safe_ad = self.advertisement.replace('\\n', '\n')  # 处理换行符
+            message += f"\n\n{safe_ad}"
             
         return message
         
@@ -474,11 +485,18 @@ class TronEnergyBot:
                     await wait_message.delete()
                     chunks = [result_message[i:i+4000] for i in range(0, len(result_message), 4000)]
                     for chunk in chunks:
-                        await update.message.reply_text(
-                            chunk,
-                            parse_mode='Markdown',
-                            disable_web_page_preview=True
-                        )
+                        try:
+                            await update.message.reply_text(
+                                chunk,
+                                parse_mode='Markdown',
+                                disable_web_page_preview=True
+                            )
+                        except Exception as e:
+                            # 如果 Markdown 解析失败，使用纯文本模式
+                            await update.message.reply_text(
+                                chunk,
+                                disable_web_page_preview=True
+                            )
                 else:
                     # 消息长度合适，直接更新
                     try:
@@ -490,11 +508,18 @@ class TronEnergyBot:
                     except Exception as e:
                         # 如果编辑失败，尝试发送新消息
                         await wait_message.delete()
-                        await update.message.reply_text(
-                            result_message,
-                            parse_mode='Markdown',
-                            disable_web_page_preview=True
-                        )
+                        try:
+                            await update.message.reply_text(
+                                result_message,
+                                parse_mode='Markdown',
+                                disable_web_page_preview=True
+                            )
+                        except Exception as e2:
+                            # 如果 Markdown 还是失败，使用纯文本模式
+                            await update.message.reply_text(
+                                result_message,
+                                disable_web_page_preview=True
+                            )
             
         except Exception as e:
             logger.error(f"查询出错: {e}")
