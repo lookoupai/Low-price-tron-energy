@@ -6,12 +6,13 @@ import asyncio
 import time
 import re
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 from telegram.error import TelegramError
@@ -22,6 +23,8 @@ from cachetools import TTLCache
 
 from tron_energy_finder import TronEnergyFinder
 from blacklist_manager import BlacklistManager
+from whitelist_manager import WhitelistManager
+from settings_manager import SettingsManager
 
 # 配置日志
 logging.basicConfig(
@@ -57,6 +60,10 @@ class TronEnergyBot:
         
         # 初始化黑名单管理器
         self.blacklist_manager = BlacklistManager()
+        # 初始化白名单管理器
+        self.whitelist_manager = WhitelistManager()
+        # 设置管理器
+        self.settings_manager = SettingsManager()
         
         # 初始化调度器
         self.scheduler = AsyncIOScheduler()
@@ -72,6 +79,45 @@ class TronEnergyBot:
         
         # TRON地址检测正则表达式
         self.tron_address_pattern = re.compile(r'\b(T[1-9A-HJ-NP-Za-km-z]{33})\b')
+        
+        # 回调负载缓存（避免超长callback_data）
+        self._cb_payloads: TTLCache = TTLCache(maxsize=1000, ttl=3600)
+
+    def _store_cb_payload(self, payment: str, provider: str) -> str:
+        import uuid
+        key = uuid.uuid4().hex[:10]
+        self._cb_payloads[key] = (payment, provider)
+        return key
+
+    def _get_cb_payload(self, key: str):
+        return self._cb_payloads.get(key)
+
+    def _build_inline_keyboard(self, addr: Dict) -> InlineKeyboardMarkup:
+        """为单条地址信息构建操作按钮"""
+        payment = addr.get('address')
+        provider = addr.get('energy_provider')
+        payload_key = self._store_cb_payload(payment, provider)
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    text='✅ 我已成功获得能量（两者加入白名单）',
+                    callback_data=f"vote_success:{payload_key}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text='❌ 我未获得能量（两者加入黑名单）',
+                    callback_data=f"vote_fail:{payload_key}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text='▶️ 更多操作',
+                    callback_data=f"more_ops:{payload_key}"
+                )
+            ]
+        ]
+        return InlineKeyboardMarkup(buttons)
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理/start命令"""
@@ -377,6 +423,90 @@ class TronEnergyBot:
             logger.error(f"查看黑名单统计出错: {e}")
             await self._handle_error(update, context, str(e))
 
+    async def whitelist_add_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            if not context.args or len(context.args) < 2:
+                await update.message.reply_text("❌ 用法：/whitelist_add <地址> <payment|provider> [原因]")
+                return
+            address = context.args[0]
+            addr_type = context.args[1]
+            reason = " ".join(context.args[2:]) if len(context.args) > 2 else f"用户 {update.effective_user.id} 添加"
+            await self.whitelist_manager.add_address(address, addr_type, reason, update.effective_user.id, is_provisional=True)
+            await update.message.reply_text(f"✅ 已将 {address} 作为 {addr_type} 加入白名单（临时）。")
+        except Exception as e:
+            logger.error(f"whitelist_add 出错: {e}")
+            await self._handle_error(update, context, str(e))
+
+    async def whitelist_check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            if not context.args or len(context.args) < 2:
+                await update.message.reply_text("❌ 用法：/whitelist_check <地址> <payment|provider>")
+                return
+            address = context.args[0]
+            addr_type = context.args[1]
+            info = await self.whitelist_manager.check_address(address, addr_type)
+            if info:
+                provisional = '（临时）' if info.get('is_provisional') else ''
+                await update.message.reply_text(
+                    f"✅ 白名单：{address} ({addr_type}) {provisional}\n次数：{info.get('success_count', 1)}"
+                )
+            else:
+                await update.message.reply_text("ℹ️ 未找到白名单记录")
+        except Exception as e:
+            logger.error(f"whitelist_check 出错: {e}")
+            await self._handle_error(update, context, str(e))
+
+    async def whitelist_remove_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            if not await self.check_admin_rights(update, context):
+                await update.message.reply_text("❌ 您没有权限执行此操作，只有管理员可以移除白名单")
+                return
+            if not context.args or len(context.args) < 2:
+                await update.message.reply_text("❌ 用法：/whitelist_remove <地址> <payment|provider>")
+                return
+            address = context.args[0]
+            addr_type = context.args[1]
+            await self.whitelist_manager.remove_address(address, addr_type)
+            await update.message.reply_text(f"✅ 已移除白名单：{address} ({addr_type})")
+        except Exception as e:
+            logger.error(f"whitelist_remove 出错: {e}")
+            await self._handle_error(update, context, str(e))
+
+    async def whitelist_stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            stats = await self.whitelist_manager.get_stats()
+            await update.message.reply_text(
+                f"📊 白名单统计：\n单地址：{stats.get('addresses', 0)}\n组合：{stats.get('pairs', 0)}"
+            )
+        except Exception as e:
+            logger.error(f"whitelist_stats 出错: {e}")
+            await self._handle_error(update, context, str(e))
+
+    async def assoc_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """黑名单关联开关：/assoc on | off | status"""
+        try:
+            if not await self.check_admin_rights(update, context):
+                await update.message.reply_text("❌ 您没有权限执行此操作，只有管理员可以配置关联开关")
+                return
+            if not context.args:
+                await update.message.reply_text("用法：/assoc on|off|status")
+                return
+            sub = context.args[0].lower()
+            if sub == 'on':
+                await self.settings_manager.set_blacklist_association_enabled(True)
+                await update.message.reply_text("✅ 已开启黑名单单向关联（提供方→收款地址）")
+            elif sub == 'off':
+                await self.settings_manager.set_blacklist_association_enabled(False)
+                await update.message.reply_text("✅ 已关闭黑名单单向关联")
+            else:
+                enabled = await self.settings_manager.is_blacklist_association_enabled()
+                await update.message.reply_text(
+                    f"当前状态：{'开启' if enabled else '关闭'}"
+                )
+        except Exception as e:
+            logger.error(f"assoc 命令出错: {e}")
+            await self._handle_error(update, context, str(e))
+
     async def send_message_to_chat(self, chat_id: int, text: str, **kwargs) -> None:
         """发送消息到指定聊天"""
         try:
@@ -409,7 +539,7 @@ class TronEnergyBot:
         return text
 
     def format_address_info(self, addr: Dict) -> str:
-        """格式化地址信息为消息文本"""
+        """格式化地址信息为消息文本，包含分层状态展示（方案A）"""
         energy_display = addr['energy_quantity']
         if addr['energy_source'] == "计算值":
             energy_display = f"{energy_display} (计算值，仅供参考)"
@@ -423,14 +553,34 @@ class TronEnergyBot:
             f"🔹 【24h交易数】: {addr['recent_tx_count']} 笔\n"
             f"🔹 【转账哈希】: `{addr['tx_hash']}`\n"
             f"🔹 【代理哈希】: `{addr['proxy_tx_hash']}`\n\n"
-            f"🎊 【地址状态】{addr['status']}\n\n"
         )
-        
-        # 检查并添加黑名单警告
-        if addr.get('blacklist_warning'):
-            message += f"⚠️ **黑名单警告**:\n{addr['blacklist_warning']}\n\n"
+
+        # 分层状态展示
+        message += "📊 状态分析：\n"
+        # 白名单
+        wl_notice = addr.get('whitelist_notice') or ""
+        if wl_notice:
+            message += f"✅ 白名单状态：\n  └ {wl_notice}\n"
+        else:
+            # 逐项显示
+            if addr.get('payment_whitelisted'):
+                message += "✅ 白名单状态：\n  └ 收款地址：已在白名单\n"
+            if addr.get('provider_whitelisted'):
+                if '✅ 白名单状态' not in message:
+                    message += "✅ 白名单状态：\n"
+                message += "  └ 能量提供方：已在白名单\n"
+            if not (addr.get('payment_whitelisted') or addr.get('provider_whitelisted')):
+                message += "✅ 白名单状态：暂无记录\n"
+
+        # 黑名单
+        bl_warn = addr.get('blacklist_warning') or ""
+        if bl_warn:
+            message += f"\n⚠️ 黑名单状态：\n{bl_warn}\n"
+        else:
+            message += "\n⚠️ 黑名单状态：暂无记录\n"
             
-        message += f"🈹 TRX #{addr['purchase_amount']}"  # 添加金额标签
+        message += f"\n🈹 TRX #{addr['purchase_amount']}\n"
+        message += "\n按钮说明：成功=两者加白；未成功=两者加黑；更多=展开单独添加/撤回"
 
         # 如果配置了广告内容，添加到消息末尾
         if self.advertisement:
@@ -482,54 +632,29 @@ class TronEnergyBot:
                     await wait_message.edit_text("❌ 未找到符合条件的低价能量地址，请稍后再试")
                     return
                     
-                # 更新等待消息为结果
+                # 先更新时间提示
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                result_message = f"🎯 查询时间：{current_time}\n\n"
-                
+                await wait_message.edit_text(
+                    f"🎯 查询时间：{current_time}\n\n已为您找到以下结果：",
+                )
+
+                # 每条结果独立消息+按钮
                 for addr in addresses:
-                    result_message += self.format_address_info(addr) + "\n\n"
-                    
-                # 分段发送消息，避免消息过长
-                if len(result_message) > 4000:
-                    # 如果消息太长，分段发送
-                    await wait_message.delete()
-                    chunks = [result_message[i:i+4000] for i in range(0, len(result_message), 4000)]
-                    for chunk in chunks:
-                        try:
-                            await update.message.reply_text(
-                                chunk,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                        except Exception as e:
-                            # 如果 Markdown 解析失败，使用纯文本模式
-                            await update.message.reply_text(
-                                chunk,
-                                disable_web_page_preview=True
-                            )
-                else:
-                    # 消息长度合适，直接更新
+                    text = self.format_address_info(addr)
+                    markup = self._build_inline_keyboard(addr)
                     try:
-                        await wait_message.edit_text(
-                            result_message,
+                        await update.message.reply_text(
+                            text=text,
                             parse_mode='Markdown',
-                            disable_web_page_preview=True
+                            disable_web_page_preview=True,
+                            reply_markup=markup,
                         )
-                    except Exception as e:
-                        # 如果编辑失败，尝试发送新消息
-                        await wait_message.delete()
-                        try:
-                            await update.message.reply_text(
-                                result_message,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True
-                            )
-                        except Exception as e2:
-                            # 如果 Markdown 还是失败，使用纯文本模式
-                            await update.message.reply_text(
-                                result_message,
-                                disable_web_page_preview=True
-                            )
+                    except Exception:
+                        await update.message.reply_text(
+                            text=text,
+                            disable_web_page_preview=True,
+                            reply_markup=markup,
+                        )
             
         except Exception as e:
             logger.error(f"查询出错: {e}")
@@ -537,6 +662,94 @@ class TronEnergyBot:
                 await wait_message.edit_text("❌ 查询过程中出现错误，请稍后重试")
             except:
                 await update.message.reply_text("❌ 查询过程中出现错误，请稍后重试")
+
+    async def inline_button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """处理内联按钮回调"""
+        try:
+            query = update.callback_query
+            if not query or not query.data:
+                return
+            await query.answer()
+            action, _, key = query.data.partition(":")
+            payload = self._get_cb_payload(key)
+            if not payload:
+                await query.edit_message_text("⏳ 操作已过期，请重新打开最新消息进行操作。")
+                return
+            payment, provider = payload
+
+            user_id = update.effective_user.id if update.effective_user else None
+            if action == 'vote_success':
+                # 两者加入白名单（临时）+ 组合白名单
+                await self.whitelist_manager.add_address(payment, 'payment', f'用户{user_id}反馈成功', user_id, is_provisional=True)
+                await self.whitelist_manager.add_address(provider, 'provider', f'用户{user_id}反馈成功', user_id, is_provisional=True)
+                await self.whitelist_manager.add_pair(payment, provider, user_id, is_provisional=True)
+                await query.edit_message_text(
+                    text=(
+                        "✅ 已记录：您已成功获得能量\n\n"
+                        "• 收款地址与能量提供方已加入白名单（临时）\n"
+                        "• 如需撤回，请联系管理员\n"
+                        "• 感谢您的反馈，已帮助他人判断可信地址"
+                    )
+                )
+            elif action == 'vote_fail':
+                # 两者加入黑名单（临时），并尝试单向关联（提供方→收款地址）
+                await self.blacklist_manager.add_to_blacklist(payment, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True)
+                await self.blacklist_manager.add_to_blacklist(provider, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True)
+                # 触发一次关联逻辑（内部有开关）
+                try:
+                    await self.blacklist_manager.auto_associate_addresses(payment, provider)
+                except Exception:
+                    pass
+                await query.edit_message_text(
+                    text=(
+                        "❌ 已记录：您未成功获得能量\n\n"
+                        "• 收款地址与能量提供方已加入黑名单（临时）\n"
+                        "• 如需撤回，请联系管理员\n"
+                        "• 感谢您的反馈，已帮助他人规避风险"
+                    )
+                )
+            elif action == 'more_ops':
+                # 展开更多操作选择
+                buttons = [
+                    [InlineKeyboardButton('🧩 仅收款地址成功（加白）', callback_data=f'only_pay_wl:{key}')],
+                    [InlineKeyboardButton('🔋 仅提供方成功（加白）', callback_data=f'only_prov_wl:{key}')],
+                    [InlineKeyboardButton('🚩 仅收款地址有问题（加黑）', callback_data=f'only_pay_bl:{key}')],
+                    [InlineKeyboardButton('🧨 仅提供方有问题（加黑）', callback_data=f'only_prov_bl:{key}')],
+                    [InlineKeyboardButton('↩️ 撤回我的反馈', callback_data=f'revoke:{key}')],
+                    [InlineKeyboardButton('❌ 取消', callback_data=f'cancel:{key}')],
+                ]
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
+            elif action == 'only_pay_wl':
+                await self.whitelist_manager.add_address(payment, 'payment', '用户反馈：仅收款地址成功', user_id, is_provisional=True)
+                await query.edit_message_text('✅ 已记录：仅收款地址加入白名单（临时）。如需撤回，请联系管理员。')
+            elif action == 'only_prov_wl':
+                await self.whitelist_manager.add_address(provider, 'provider', '用户反馈：仅提供方成功', user_id, is_provisional=True)
+                await query.edit_message_text('✅ 已记录：仅能量提供方加入白名单（临时）。如需撤回，请联系管理员。')
+            elif action == 'only_pay_bl':
+                await self.blacklist_manager.add_to_blacklist(payment, '用户反馈：仅收款地址有问题', user_id, 'manual', is_provisional=True)
+                await query.edit_message_text('❌ 已记录：仅收款地址加入黑名单（临时）。如需撤回，请联系管理员。')
+            elif action == 'only_prov_bl':
+                await self.blacklist_manager.add_to_blacklist(provider, '用户反馈：仅提供方有问题', user_id, 'manual', is_provisional=True)
+                try:
+                    await self.blacklist_manager.auto_associate_addresses(payment, provider)
+                except Exception:
+                    pass
+                await query.edit_message_text('❌ 已记录：仅能量提供方加入黑名单（临时）。如需撤回，请联系管理员。')
+            elif action == 'revoke':
+                # 预留：撤回逻辑后续实现（需要记录投票表与时间戳）
+                await query.edit_message_text('ℹ️ 撤回功能即将上线，暂请联系管理员处理。')
+            elif action == 'cancel':
+                # 取消操作：恢复原始按钮
+                original_markup = self._build_inline_keyboard({
+                    'address': payment,
+                    'energy_provider': provider
+                })
+                await query.edit_message_reply_markup(reply_markup=original_markup)
+                await query.answer("已取消，已恢复原始选项")
+            else:
+                await query.edit_message_text('操作已完成。')
+        except Exception as e:
+            logger.error(f"处理回调失败: {e}")
             
     async def broadcast_addresses(self, context: ContextTypes.DEFAULT_TYPE, specific_chat_id: Optional[int] = None) -> None:
         """向活跃的频道广播地址信息"""
@@ -566,43 +779,35 @@ class TronEnergyBot:
                             logger.error(f"发送消息到频道 {specific_chat_id} 失败: {e}")
                     return
                 
-                # 构建消息
+                # 构建并发送每条消息
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                message = f"⏰ 定时推送 - {current_time}\n\n"
-                
-                for addr in addresses:
-                    message += self.format_address_info(addr) + "\n\n"
-                
-                # 如果指定了特定的chat_id，只发送给该chat
+                header = f"⏰ 定时推送 - {current_time}"
+
+                async def send_to(chat_id: int):
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=header)
+                    except Exception:
+                        pass
+                    for addr in addresses:
+                        text = self.format_address_info(addr)
+                        markup = self._build_inline_keyboard(addr)
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=text,
+                                parse_mode='Markdown',
+                                disable_web_page_preview=True,
+                                reply_markup=markup,
+                            )
+                        except Exception as e:
+                            logger.error(f"发送消息到频道 {chat_id} 失败: {e}")
+
                 if specific_chat_id is not None:
-                    try:
-                        logger.info(f"尝试发送消息到特定频道 {specific_chat_id}")
-                        await context.bot.send_message(
-                            chat_id=specific_chat_id,
-                            text=message,
-                            parse_mode='Markdown',
-                            disable_web_page_preview=True
-                        )
-                        logger.info(f"成功发送消息到频道 {specific_chat_id}")
-                    except Exception as e:
-                        logger.error(f"发送消息到频道 {specific_chat_id} 失败: {e}")
+                    await send_to(specific_chat_id)
                     return
-                
-                # 否则发送给所有活跃的频道
-                logger.info(f"开始向所有活跃频道广播消息，活跃频道数: {len(self.active_channels)}")
+
                 for channel_id in self.active_channels:
-                    try:
-                        logger.info(f"尝试发送消息到频道 {channel_id}")
-                        await context.bot.send_message(
-                            chat_id=channel_id,
-                            text=message,
-                            parse_mode='Markdown',
-                            disable_web_page_preview=True
-                        )
-                        logger.info(f"成功发送消息到频道 {channel_id}")
-                    except Exception as e:
-                        logger.error(f"发送消息到频道 {channel_id} 失败: {e}")
-                        continue
+                    await send_to(channel_id)
             
         except Exception as e:
             logger.error(f"广播地址时出错: {e}")
@@ -652,6 +857,18 @@ class TronEnergyBot:
             self.application.add_handler(CommandHandler("blacklist_check", self.blacklist_check_command))
             self.application.add_handler(CommandHandler("blacklist_remove", self.blacklist_remove_command))
             self.application.add_handler(CommandHandler("blacklist_stats", self.blacklist_stats_command))
+
+            # 白名单相关命令
+            self.application.add_handler(CommandHandler("whitelist_add", self.whitelist_add_command))
+            self.application.add_handler(CommandHandler("whitelist_check", self.whitelist_check_command))
+            self.application.add_handler(CommandHandler("whitelist_remove", self.whitelist_remove_command))
+            self.application.add_handler(CommandHandler("whitelist_stats", self.whitelist_stats_command))
+
+            # 黑名单关联开关
+            self.application.add_handler(CommandHandler("assoc", self.assoc_command))
+
+            # 回调按钮处理
+            self.application.add_handler(CallbackQueryHandler(self.inline_button_handler))
             
             # 添加新成员处理器
             self.application.add_handler(MessageHandler(

@@ -139,6 +139,8 @@ class TronEnergyFinder:
         
         # 黑名单管理器（延迟初始化）
         self._blacklist_manager = None
+        # 白名单管理器（延迟初始化）
+        self._whitelist_manager = None
         
     async def init_blacklist_manager(self):
         """初始化黑名单管理器"""
@@ -151,48 +153,97 @@ class TronEnergyFinder:
             except Exception as e:
                 logger.warning(f"黑名单管理器初始化失败: {e}")
                 self._blacklist_manager = None
+
+    async def init_whitelist_manager(self):
+        """初始化白名单管理器"""
+        if self._whitelist_manager is None:
+            try:
+                from whitelist_manager import WhitelistManager
+                self._whitelist_manager = WhitelistManager()
+                await self._whitelist_manager.init_database()
+                logger.info("白名单管理器初始化成功")
+            except Exception as e:
+                logger.warning(f"白名单管理器初始化失败: {e}")
+                self._whitelist_manager = None
                 
     async def check_and_handle_blacklist(self, payment_address: str, energy_provider: str) -> Dict:
-        """检查黑名单并处理自动关联"""
+        """综合检查白名单与黑名单，并根据设置进行自动关联。
+
+        白名单优先：
+        - 若“收款地址+能量提供方”组合在白名单，则不显示黑名单警告，仅提示白名单成功信息。
+        - 若只有其中一方在白名单，则提示"曾有人通过此【收款地址/能量提供方】成功，但不是当前组合"。
+        - 其他情况下，展示黑名单信息与自动关联结果（仅保留 提供方→收款地址）。
+        """
         result = {
             'payment_blacklisted': False,
             'provider_blacklisted': False,
             'blacklist_warning': '',
-            'auto_associated': False
+            'auto_associated': False,
+            'payment_whitelisted': False,
+            'provider_whitelisted': False,
+            'pair_whitelisted': False,
+            'whitelist_notice': ''
         }
-        
+
         try:
+            # 初始化管理器
             if self._blacklist_manager is None:
                 await self.init_blacklist_manager()
-            
+            if self._whitelist_manager is None:
+                await self.init_whitelist_manager()
+
+            # 白名单检查
+            pair_info = None
+            payment_wl = None
+            provider_wl = None
+            if self._whitelist_manager is not None:
+                pair_info = await self._whitelist_manager.check_pair(payment_address, energy_provider)
+                payment_wl = await self._whitelist_manager.check_address(payment_address, 'payment')
+                provider_wl = await self._whitelist_manager.check_address(energy_provider, 'provider')
+
+            if pair_info:
+                result['pair_whitelisted'] = True
+                provisional_tag = '（临时）' if pair_info.get('is_provisional') else ''
+                result['whitelist_notice'] = f"✅ 曾有人成功获得能量租凭，因此已加入白名单{provisional_tag}。"
+                # 组合白名单优先，直接返回，不展示黑名单
+                return result
+
+            if payment_wl:
+                result['payment_whitelisted'] = True
+                provisional_tag = '（临时）' if payment_wl.get('is_provisional') else ''
+                result['whitelist_notice'] += f"ℹ️ 曾有人通过此收款地址收到能量租凭，但不是这个能量提供方{provisional_tag}。\n"
+            if provider_wl:
+                result['provider_whitelisted'] = True
+                provisional_tag = '（临时）' if provider_wl.get('is_provisional') else ''
+                result['whitelist_notice'] += f"ℹ️ 曾有人通过此能量提供方收到能量租凭，但不是这个收款地址{provisional_tag}。\n"
+
+            # 黑名单检查与关联（若无组合白名单）
             if self._blacklist_manager is None:
                 return result
-                
-            # 检查收款地址
+
             payment_info = await self._blacklist_manager.check_blacklist(payment_address)
             if payment_info:
                 result['payment_blacklisted'] = True
-                result['blacklist_warning'] += f"⚠️ 收款地址已列入黑名单: {payment_info.get('reason', '未提供原因')}\n"
-                
-            # 检查能量提供方
+                provisional_tag = '（临时）' if payment_info.get('is_provisional') else ''
+                result['blacklist_warning'] += f"⚠️ 收款地址已列入黑名单{provisional_tag}: {payment_info.get('reason', '未提供原因')}\n"
+
             provider_info = await self._blacklist_manager.check_blacklist(energy_provider)
             if provider_info:
                 result['provider_blacklisted'] = True
-                result['blacklist_warning'] += f"⚠️ 能量提供方已列入黑名单: {provider_info.get('reason', '未提供原因')}\n"
-                
-            # 自动关联逻辑
+                provisional_tag = '（临时）' if provider_info.get('is_provisional') else ''
+                result['blacklist_warning'] += f"⚠️ 能量提供方已列入黑名单{provisional_tag}: {provider_info.get('reason', '未提供原因')}\n"
+
+            # 自动关联：仅当任一方在黑名单时尝试，内部仅传播 提供方->收款地址
             if result['payment_blacklisted'] or result['provider_blacklisted']:
                 success = await self._blacklist_manager.auto_associate_addresses(payment_address, energy_provider)
                 if success:
                     result['auto_associated'] = True
                     result['blacklist_warning'] += "🔗 已自动关联相关地址到黑名单\n"
-                    
-                # 添加风险警告
                 result['blacklist_warning'] += "💡 此地址已被提交黑名单，有白名单限制，直接转TRX可能无法获得能量！"
-                
+
         except Exception as e:
-            logger.error(f"黑名单检查失败: {e}")
-            
+            logger.error(f"名单检查失败: {e}")
+
         return result
         
     def _get_result_file(self) -> pathlib.Path:

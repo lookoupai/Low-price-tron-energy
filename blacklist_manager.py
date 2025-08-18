@@ -6,6 +6,7 @@ from typing import List, Dict, Optional, Tuple
 from cachetools import TTLCache
 import os
 from dotenv import load_dotenv
+from settings_manager import SettingsManager
 
 # 加载环境变量
 load_dotenv()
@@ -22,6 +23,7 @@ class BlacklistManager:
         # 黑名单缓存，TTL为5分钟
         self._blacklist_cache = TTLCache(maxsize=1000, ttl=300)
         self._connection_pool = None
+        self._settings_manager: Optional[SettingsManager] = None
         
     async def init_database(self):
         """初始化数据库连接池和表结构"""
@@ -54,8 +56,14 @@ class BlacklistManager:
                     type VARCHAR(20) DEFAULT 'manual',
                     added_by BIGINT,
                     added_at TIMESTAMP DEFAULT NOW(),
-                    is_active BOOLEAN DEFAULT true
+                    is_active BOOLEAN DEFAULT true,
+                    is_provisional BOOLEAN DEFAULT false
                 )
+            ''')
+            # 兼容已存在表，补充缺失列
+            await connection.execute('''
+                ALTER TABLE blacklist
+                ADD COLUMN IF NOT EXISTS is_provisional BOOLEAN DEFAULT false
             ''')
             
             # 创建关联记录表
@@ -77,7 +85,8 @@ class BlacklistManager:
             ''')
             
     async def add_to_blacklist(self, address: str, reason: str = None, 
-                             added_by: int = None, addr_type: str = 'manual') -> bool:
+                             added_by: int = None, addr_type: str = 'manual',
+                             is_provisional: bool = False) -> bool:
         """添加地址到黑名单"""
         try:
             # 验证地址格式
@@ -90,14 +99,15 @@ class BlacklistManager:
                 
             async with self._connection_pool.acquire() as connection:
                 await connection.execute('''
-                    INSERT INTO blacklist (address, reason, type, added_by)
-                    VALUES ($1, $2, $3, $4)
+                    INSERT INTO blacklist (address, reason, type, added_by, is_provisional)
+                    VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (address) 
                     DO UPDATE SET 
                         reason = COALESCE(EXCLUDED.reason, blacklist.reason),
                         is_active = true,
-                        added_at = NOW()
-                ''', address, reason, addr_type, added_by)
+                        added_at = NOW(),
+                        is_provisional = EXCLUDED.is_provisional
+                ''', address, reason, addr_type, added_by, is_provisional)
                 
             # 清除缓存
             self._blacklist_cache.pop(address, None)
@@ -126,7 +136,7 @@ class BlacklistManager:
                 
             async with self._connection_pool.acquire() as connection:
                 result = await connection.fetchrow('''
-                    SELECT address, reason, type, added_by, added_at, is_active
+                    SELECT address, reason, type, added_by, added_at, is_active, is_provisional
                     FROM blacklist 
                     WHERE address = $1 AND is_active = true
                 ''', address)
@@ -138,7 +148,8 @@ class BlacklistManager:
                         'type': result['type'],
                         'added_by': result['added_by'],
                         'added_at': result['added_at'],
-                        'is_active': result['is_active']
+                        'is_active': result['is_active'],
+                        'is_provisional': result['is_provisional']
                     }
                     # 缓存结果
                     self._blacklist_cache[address] = blacklist_info
@@ -198,30 +209,42 @@ class BlacklistManager:
             return False
             
     async def auto_associate_addresses(self, address1: str, address2: str) -> bool:
-        """自动关联两个地址（如果其中一个在黑名单中）"""
+        """自动关联：仅当 能量提供方(address2或address1) 在黑名单时，将收款地址关联入黑名单。
+
+        规则：
+        - 仅保留 提供方 -> 收款地址 单向关联
+        - 受设置项 blacklist_association_enabled 控制
+        - 若提供方为临时黑名单，则关联的收款地址也为临时黑名单
+        """
         try:
+            # 设置开关
+            if self._settings_manager is None:
+                self._settings_manager = SettingsManager()
+                await self._settings_manager.init_database()
+
+            if not await self._settings_manager.is_blacklist_association_enabled():
+                return False
+
             # 检查两个地址的黑名单状态
-            result1 = await self.check_blacklist(address1)
-            result2 = await self.check_blacklist(address2)
+            result1 = await self.check_blacklist(address1)  # 可能是收款或提供方
+            result2 = await self.check_blacklist(address2)  # 可能是收款或提供方
             
-            # 如果address1在黑名单中，将address2也加入
-            if result1 and not result2:
+            # 仅当 能量提供方 在黑名单时进行传播。这里我们无法仅凭入参判断角色，
+            # 约定 address1 为收款地址，address2 为能量提供方（调用方需按此传参）。
+            payment_address = address1
+            provider_address = address2
+
+            provider_black = await self.check_blacklist(provider_address)
+            payment_black = await self.check_blacklist(payment_address)
+
+            if provider_black and not payment_black:
                 await self.add_to_blacklist(
-                    address2, 
-                    f"关联黑名单地址 {address1}", 
-                    addr_type='auto_associated'
+                    payment_address,
+                    f"关联黑名单能量提供方 {provider_address}",
+                    addr_type='auto_associated',
+                    is_provisional=bool(provider_black.get('is_provisional'))
                 )
-                await self.add_association(address1, address2)
-                return True
-                
-            # 如果address2在黑名单中，将address1也加入
-            elif result2 and not result1:
-                await self.add_to_blacklist(
-                    address1, 
-                    f"关联黑名单地址 {address2}", 
-                    addr_type='auto_associated'
-                )
-                await self.add_association(address2, address1)
+                await self.add_association(provider_address, payment_address)
                 return True
                 
             return False
