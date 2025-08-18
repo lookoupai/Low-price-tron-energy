@@ -632,15 +632,17 @@ class TronEnergyBot:
                     await wait_message.edit_text("❌ 未找到符合条件的低价能量地址，请稍后再试")
                     return
                     
-                # 先更新时间提示
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                await wait_message.edit_text(
-                    f"🎯 查询时间：{current_time}\n\n已为您找到以下结果：",
-                )
+                # 删除等待消息，避免出现额外的时间/提示消息
+                try:
+                    await wait_message.delete()
+                except Exception:
+                    pass
 
-                # 每条结果独立消息+按钮
+                # 为每条地址单独发送消息，并在顶部包含时间
+                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                prefix = f"🎯 查询时间：{current_time}\n\n"
                 for addr in addresses:
-                    text = self.format_address_info(addr)
+                    text = prefix + self.format_address_info(addr)
                     markup = self._build_inline_keyboard(addr)
                     try:
                         await update.message.reply_text(
@@ -779,17 +781,13 @@ class TronEnergyBot:
                             logger.error(f"发送消息到频道 {specific_chat_id} 失败: {e}")
                     return
                 
-                # 构建并发送每条消息
+                # 为每条地址发送一条带按钮的消息，时间包含在每条消息顶部
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                header = f"⏰ 定时推送 - {current_time}"
+                prefix = f"⏰ 定时推送 - {current_time}\n\n"
 
                 async def send_to(chat_id: int):
-                    try:
-                        await context.bot.send_message(chat_id=chat_id, text=header)
-                    except Exception:
-                        pass
                     for addr in addresses:
-                        text = self.format_address_info(addr)
+                        text = prefix + self.format_address_info(addr)
                         markup = self._build_inline_keyboard(addr)
                         try:
                             await context.bot.send_message(
