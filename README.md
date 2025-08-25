@@ -47,7 +47,7 @@ telegram频道：https://t.me/lowtron
      - ❌ 我未获得能量（两者加入黑名单，临时）
      - ▶️ 更多操作（展开：仅收款地址成功/仅提供方成功/仅收款地址有问题/仅提供方有问题/撤回/取消）
    - 按钮说明：成功=两者加白；未成功=两者加黑；更多=展开单独添加/撤回
-   - 频道场景采用“轻量投票”：点击即记录并回执（无需与机器人私聊）
+   - 频道场景采用"轻量投票"：点击即记录并回执（无需与机器人私聊）
 
 6. **文件自动清理功能**
    - 自动清理过期的查询结果文件
@@ -57,7 +57,29 @@ telegram频道：https://t.me/lowtron
 
 7. **管理员设置**
    - 黑名单单向关联开关：`/assoc on` 开启、`/assoc off` 关闭、`/assoc status` 查看
-   - 默认开启单向关联，仅当“能量提供方”在黑名单时，才会传播到“收款地址”（反向不传播）
+   - 默认开启单向关联，仅当"能量提供方"在黑名单时，才会传播到"收款地址"（反向不传播）
+
+8. **数据管理与维护功能**
+   - **查看数据状态**：
+     ```bash
+     python verify_associations.py                    # 基本统计信息
+     python verify_associations.py --detailed         # 详细信息（最近记录）
+     python verify_associations.py --export          # 导出数据到CSV
+     ```
+   - **备份数据**：
+     ```bash
+     python clear_associations.py --backup-only      # 仅备份，不清理
+     ```
+   - **清理关联数据**：
+     ```bash
+     python clear_associations.py --clear-all        # 清空所有关联数据重新开始
+     python clear_associations.py --clear-associations-only  # 只清空关联表
+     ```
+   - **恢复数据**：
+     ```bash
+     python clear_associations.py --restore <备份文件>  # 从备份恢复
+     ```
+   - **预览操作**：在任何命令后添加 `--dry-run` 可预览操作而不实际执行
 
 ## 环境要求
 
@@ -132,7 +154,14 @@ telegram频道：https://t.me/lowtron
         - ❌ 我未获得能量（两者加入黑名单，临时）
         - ▶️ 更多操作（按需仅对“收款地址”或“提供方”加白/加黑，或撤回；撤回功能将于后续版本开放）
      4. 管理员可使用 `/blacklist_remove`、`/whitelist_remove` 移除误报地址
-     5. 管理员可用 `/assoc on|off|status` 控制“提供方→收款地址”的自动关联
+     5. 管理员可用 `/assoc on|off|status` 控制"提供方→收款地址"的自动关联
+   
+   - 数据管理使用：
+     1. 使用 `python verify_associations.py` 查看当前关联数据状态
+     2. 如需清空重新开始，先用 `python clear_associations.py --backup-only` 备份
+     3. 使用 `python clear_associations.py --clear-all` 清空所有关联数据
+     4. 重启机器人，新的关联将从此开始积累
+     5. 如需恢复，使用 `python clear_associations.py --restore <备份文件>`
 
 ## 注意事项
 

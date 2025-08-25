@@ -40,3 +40,27 @@ __pycache__/
 results/
 myenv/
 venv/
+
+# Backup files (地址关联数据备份)
+associations_backup_*.json
+*.backup
+*.bak
+
+# Export files (数据导出文件)
+exports/
+*.csv
+
+# Temporary files (临时文件)
+example_backup.json
+temp/
+tmp/
+
+# Database files (数据库文件)
+*.db
+*.sqlite
+*.sqlite3
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
