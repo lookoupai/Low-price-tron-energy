@@ -587,12 +587,16 @@ class TronEnergyFinder:
                                                 "status": "正常使用"
                                             }
                                             
-                                            # 添加黑名单相关信息
+                                            # 添加黑名单和白名单相关信息
                                             result.update({
                                                 "payment_blacklisted": blacklist_result['payment_blacklisted'],
                                                 "provider_blacklisted": blacklist_result['provider_blacklisted'],
                                                 "blacklist_warning": blacklist_result['blacklist_warning'],
-                                                "auto_associated": blacklist_result['auto_associated']
+                                                "auto_associated": blacklist_result['auto_associated'],
+                                                "payment_whitelisted": blacklist_result['payment_whitelisted'],
+                                                "provider_whitelisted": blacklist_result['provider_whitelisted'],
+                                                "pair_whitelisted": blacklist_result['pair_whitelisted'],
+                                                "whitelist_notice": blacklist_result['whitelist_notice']
                                             })
                                             
                                             return result

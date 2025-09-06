@@ -184,17 +184,25 @@ class TronEnergyBot:
             "2️⃣ 频道/群组命令：\n"
             "   /start_push - 开启定时推送（仅管理员）\n"
             "   /stop_push - 关闭定时推送（仅管理员）\n"
-            "   /query - 立即查询一次\n\n"
+            "   /query - 立即查询一次\n"
+            "   /channels - 查看活跃频道列表（仅管理员）\n\n"
             "3️⃣ 黑名单功能：\n"
             "   /blacklist_add <地址> [原因] - 添加地址到黑名单\n"
             "   /blacklist_check <地址> - 查询地址黑名单状态\n"
             "   /blacklist_remove <地址> - 从黑名单移除地址（仅管理员）\n"
             "   /blacklist_stats - 查看黑名单统计信息\n\n"
-            "4️⃣ 地址检测：\n"
+            "4️⃣ 白名单功能：\n"
+            "   /whitelist_add <地址> <payment|provider> [原因] - 添加地址到白名单\n"
+            "   /whitelist_check <地址> <payment|provider> - 查询白名单状态\n"
+            "   /whitelist_remove <地址> <payment|provider> - 移除白名单（仅管理员）\n"
+            "   /whitelist_stats - 查看白名单统计信息\n\n"
+            "5️⃣ 管理员设置：\n"
+            "   /assoc on|off|status - 黑名单关联开关（仅管理员）\n\n"
+            "6️⃣ 地址检测：\n"
             "   直接发送TRON地址自动检查黑名单状态\n\n"
             "💡 注意事项：\n"
             "   • 频道/群组中使用命令需要授予机器人管理员权限\n"
-            "   • 查询结果中会显示黑名单警告信息\n"
+            "   • 查询结果中会显示黑/白名单警告信息\n"
             "   • 发现可疑地址请及时举报到黑名单"
         )
         await update.message.reply_text(help_message)
@@ -551,6 +559,41 @@ class TronEnergyBot:
                 )
         except Exception as e:
             logger.error(f"assoc 命令出错: {e}")
+            await self._handle_error(update, context, str(e))
+
+    async def channels_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """查看当前活跃频道列表：/channels"""
+        try:
+            if not await self.check_admin_rights(update, context):
+                await update.message.reply_text("❌ 您没有权限执行此操作，只有管理员可以查看频道列表")
+                return
+                
+            if not self.active_channels:
+                await update.message.reply_text("📋 **活跃频道列表**\n\n暂无活跃频道", parse_mode='Markdown')
+                return
+                
+            message = "📋 **活跃频道列表**\n\n"
+            message += f"📊 **总数：** {len(self.active_channels)} 个频道\n\n"
+            
+            for i, channel_id in enumerate(self.active_channels, 1):
+                try:
+                    # 尝试获取频道信息
+                    chat = await context.bot.get_chat(channel_id)
+                    chat_title = chat.title or f"未知频道 ({channel_id})"
+                    chat_type = chat.type
+                    message += f"{i}. **{chat_title}**\n   ID: `{channel_id}`\n   类型: {chat_type}\n\n"
+                except Exception as e:
+                    # 如果无法获取频道信息，显示错误
+                    message += f"{i}. **无效频道**\n   ID: `{channel_id}`\n   错误: {str(e)[:50]}\n\n"
+                    
+            message += "📝 **说明：**\n"
+            message += "- 使用 `/stop_push` 在对应频道中关闭推送\n"
+            message += "- 无效频道将在下次发送失败时自动移除"
+                
+            await update.message.reply_text(message, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"channels 命令出错: {e}")
             await self._handle_error(update, context, str(e))
 
     async def send_message_to_chat(self, chat_id: int, text: str, **kwargs) -> None:
@@ -977,6 +1020,10 @@ class TronEnergyBot:
                             )
                         except Exception as e:
                             logger.error(f"发送消息到频道 {chat_id} 失败: {e}")
+                            # 如果是因为机器人被屏蔽或频道不存在，从活跃列表中移除
+                            if "Forbidden" in str(e) or "Bad Request" in str(e):
+                                logger.info(f"从活跃频道列表中移除无效频道: {chat_id}")
+                                self.active_channels.discard(chat_id)
 
                 if specific_chat_id is not None:
                     await send_to(specific_chat_id)
@@ -1042,6 +1089,9 @@ class TronEnergyBot:
 
             # 黑名单关联开关
             self.application.add_handler(CommandHandler("assoc", self.assoc_command))
+            
+            # 查看活跃频道列表
+            self.application.add_handler(CommandHandler("channels", self.channels_command))
 
             # 回调按钮处理
             self.application.add_handler(CallbackQueryHandler(self.inline_button_handler))
