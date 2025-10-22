@@ -11,6 +11,12 @@ from asyncio import Lock
 from cachetools import TTLCache
 import aiohttp
 import random
+import ssl
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 # 配置日志级别
 import logging
@@ -137,10 +143,28 @@ class TronEnergyFinder:
         self._last_api_call = 0
         self._min_api_interval = 0.1  # 最小API调用间隔（秒）
         
+        # SSL上下文
+        self._ssl_context = self._build_ssl_context()
+        
         # 黑名单管理器（延迟初始化）
         self._blacklist_manager = None
         # 白名单管理器（延迟初始化）
         self._whitelist_manager = None
+        
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        """构建SSL上下文，解决证书验证问题"""
+        try:
+            if certifi:
+                # 使用certifi提供的CA证书包
+                logger.debug("使用certifi CA证书包")
+                return ssl.create_default_context(cafile=certifi.where())
+            else:
+                # 使用系统默认的SSL context
+                logger.debug("使用系统默认SSL context")
+                return ssl.create_default_context()
+        except Exception as e:
+            logger.warning(f"创建SSL context失败: {e}，使用默认配置")
+            return ssl.create_default_context()
         
     async def init_blacklist_manager(self):
         """初始化黑名单管理器"""
@@ -406,7 +430,9 @@ class TronEnergyFinder:
                 "Accept": "application/json"
             }
             
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=self._ssl_context)
+            
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(url, params=params, headers=headers) as response:
                     if response.status == 200:
                         return await response.json()
