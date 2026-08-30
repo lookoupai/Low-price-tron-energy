@@ -1,10 +1,11 @@
 import os
 import logging
 from datetime import datetime
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict
 import asyncio
 import time
 import re
+from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,7 +17,6 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import TelegramError
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from functools import lru_cache
 from cachetools import TTLCache
@@ -25,6 +25,7 @@ from tron_energy_finder import TronEnergyFinder
 from blacklist_manager import BlacklistManager
 from whitelist_manager import WhitelistManager
 from settings_manager import SettingsManager
+from push_channel_manager import PushChannelManager
 
 # 配置日志
 logging.basicConfig(
@@ -64,13 +65,9 @@ class TronEnergyBot:
         self.whitelist_manager = WhitelistManager()
         # 设置管理器
         self.settings_manager = SettingsManager()
-        
-        # 初始化调度器
-        self.scheduler = AsyncIOScheduler()
-        
-        # 存储活跃的频道（启用了推送的频道）
-        self.active_channels: Set[int] = set()
-        
+        # 频道推送订阅
+        self.push_channel_manager = PushChannelManager()
+
         # 添加并发控制
         self._query_lock = asyncio.Lock()
         self._query_semaphore = asyncio.Semaphore(3)  # 最多同时处理3个查询
@@ -82,6 +79,49 @@ class TronEnergyBot:
         
         # 回调负载缓存（避免超长callback_data）- 延长到7天
         self._cb_payloads: TTLCache = TTLCache(maxsize=1000, ttl=604800)  # 7天 = 7*24*3600秒
+
+    def _format_price_range(self, min_trx: float, max_trx: float) -> str:
+        if min_trx == max_trx:
+            return f"{min_trx:g} TRX"
+        return f"{min_trx:g}-{max_trx:g} TRX"
+
+    def _parse_price_args(self, args: Optional[List[str]]):
+        """解析 /query 与 /start_push 的价格参数。
+
+        返回 (min_trx, max_trx)。非法输入抛 ValueError。
+        """
+        tokens = list(args or [])
+        if not tokens:
+            return self.finder.min_trx_amount, self.finder.max_trx_amount
+        if len(tokens) != 1:
+            raise ValueError("价格参数过多")
+
+        raw = tokens[0].strip()
+        if not raw:
+            raise ValueError("价格参数为空")
+
+        def _parse_amount(text: str) -> float:
+            value = round(float(text), 4)
+            if value <= 0:
+                raise ValueError("价格必须大于 0")
+            return value
+
+        try:
+            if "-" in raw:
+                left, right = raw.split("-", 1)
+                if not left.strip() or not right.strip():
+                    raise ValueError("区间格式无效")
+                lo = _parse_amount(left)
+                hi = _parse_amount(right)
+                if hi < lo:
+                    raise ValueError("区间上限不能小于下限")
+                return lo, hi
+            value = _parse_amount(raw)
+            return value, value
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("价格格式无效")
 
     def _store_cb_payload(self, payment: str, provider: str) -> str:
         import uuid
@@ -169,7 +209,9 @@ class TronEnergyBot:
         """处理/start命令"""
         welcome_message = (
             "👋 欢迎使用Tron能量查找机器人！\n\n"
-            "🔍 使用 /query 命令立即查找低成本能量代理地址\n"
+            "🔍 使用 /query 立即查找低成本能量代理地址\n"
+            "   /query 0.01      精确查找 0.01 TRX\n"
+            "   /query 0.01-0.1  查找 0.01-0.1 TRX\n"
             "ℹ️ 使用 /help 命令查看更多帮助信息"
         )
         await update.message.reply_text(welcome_message)
@@ -179,10 +221,14 @@ class TronEnergyBot:
         help_message = (
             "📖 机器人使用帮助：\n\n"
             "1️⃣ 私聊命令：\n"
-            "   /query - 立即查找低成本能量代理地址\n"
+            "   /query - 查找低成本能量代理地址（默认 0.01-1 TRX）\n"
+            "   /query 0.01 - 精确查找 0.01 TRX\n"
+            "   /query 0.01-0.1 - 查找 0.01-0.1 TRX\n"
             "   /help - 显示此帮助信息\n\n"
             "2️⃣ 频道/群组命令：\n"
-            "   /start_push - 开启定时推送（仅管理员）\n"
+            "   /start_push - 开启定时推送（默认价格，仅管理员）\n"
+            "   /start_push 0.01 - 按精确价格推送\n"
+            "   /start_push 0.01-0.1 - 按价格区间推送\n"
             "   /stop_push - 关闭定时推送（仅管理员）\n"
             "   /query - 立即查询一次\n"
             "   /channels - 查看活跃频道列表（仅管理员）\n\n"
@@ -234,49 +280,54 @@ class TronEnergyBot:
             logger.error(f"检查管理员权限时出错: {e}")
             return False
             
+    async def _reply_to_chat(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        chat = update.effective_chat
+        if not chat:
+            return
+        if chat.type in ['channel', 'supergroup', 'group']:
+            await context.bot.send_message(chat_id=chat.id, text=text)
+            return
+        if update.message:
+            await update.message.reply_text(text)
+
     async def start_push_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /start_push 命令"""
         try:
-            # 获取聊天类型和ID
             chat = update.effective_chat
             if not chat:
                 return
-            
+
             logger.info(f"收到 start_push 命令，chat_id={chat.id}, chat_type={chat.type}")
-            
-            # 检查是否是频道或群组
-            if chat.type in ['channel', 'supergroup', 'group']:
-                # 对于频道消息，我们直接添加到活跃频道列表
-                self.active_channels.add(chat.id)
-                logger.info(f"已将频道 {chat.id} 添加到活跃列表")
-                
-                try:
-                    # 发送确认消息
-                    await context.bot.send_message(
-                        chat_id=chat.id,
-                        text="✅ 已开启能量地址推送服务！正在为您查询最新地址..."
-                    )
-                    logger.info(f"已发送确认消息到频道 {chat.id}")
-                    
-                    # 立即执行一次查询
-                    await self.broadcast_addresses(context, chat.id)
-                    logger.info(f"已执行初始查询，chat_id={chat.id}")
-                    
-                except Exception as e:
-                    logger.error(f"发送消息到频道 {chat.id} 失败: {e}")
+
+            try:
+                min_trx, max_trx = self._parse_price_args(context.args)
+            except ValueError:
+                await self._reply_to_chat(
+                    update,
+                    context,
+                    "用法: /start_push [价格]\n"
+                    "  /start_push           默认 0.01-1 TRX\n"
+                    "  /start_push 0.01      精确 0.01 TRX\n"
+                    "  /start_push 0.01-0.1  区间 0.01-0.1 TRX（含两端）",
+                )
                 return
-            
-            # 如果是私聊，检查管理员权限
-            is_admin = await self.check_admin_rights(update, context)
-            if not is_admin:
-                await update.message.reply_text("❌ 抱歉，只有管理员可以使用此命令。")
-                return
-            
-            # 添加到活跃频道列表
-            self.active_channels.add(chat.id)
-            await update.message.reply_text("✅ 已开启能量地址推送服务！")
-            logger.info(f"已启用聊天 {chat.id} 的推送服务")
-            
+
+            if chat.type not in ['channel', 'supergroup', 'group']:
+                is_admin = await self.check_admin_rights(update, context)
+                if not is_admin:
+                    await self._reply_to_chat(update, context, "❌ 抱歉，只有管理员可以使用此命令。")
+                    return
+
+            await self.push_channel_manager.upsert_channel(chat.id, min_trx, max_trx)
+            range_text = self._format_price_range(min_trx, max_trx)
+            await self._reply_to_chat(
+                update,
+                context,
+                f"✅ 已开启能量地址推送服务！筛选：{range_text}\n正在为您查询最新地址...",
+            )
+            logger.info(f"已启用聊天 {chat.id} 的推送服务，筛选 {range_text}")
+            await self.broadcast_addresses(context, chat.id)
+
         except Exception as e:
             logger.error(f"处理 start_push 命令时出错: {e}", exc_info=True)
             await self._handle_error(update, context, str(e))
@@ -284,35 +335,24 @@ class TronEnergyBot:
     async def stop_push_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理 /stop_push 命令"""
         try:
-            # 获取聊天类型和ID
             chat = update.effective_chat
             if not chat:
                 return
-            
-            # 检查是否是频道或群组
-            if chat.type in ['channel', 'supergroup', 'group']:
-                # 对于频道消息，直接从活跃频道列表中移除
-                self.active_channels.discard(chat.id)
-                
-                # 发送确认消息
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text="✅ 已关闭能量地址推送服务。如需重新开启，请使用 /start_push 命令。"
-                )
-                logger.info(f"已禁用频道 {chat.id} 的推送服务")
-                return
-            
-            # 如果是私聊，检查管理员权限
-            is_admin = await self.check_admin_rights(update, context)
-            if not is_admin:
-                await update.message.reply_text("❌ 抱歉，只有管理员可以使用此命令。")
-                return
-            
-            # 从活跃频道列表中移除
-            self.active_channels.discard(chat.id)
-            await update.message.reply_text("✅ 已关闭能量地址推送服务。")
+
+            if chat.type not in ['channel', 'supergroup', 'group']:
+                is_admin = await self.check_admin_rights(update, context)
+                if not is_admin:
+                    await self._reply_to_chat(update, context, "❌ 抱歉，只有管理员可以使用此命令。")
+                    return
+
+            await self.push_channel_manager.disable_channel(chat.id)
+            await self._reply_to_chat(
+                update,
+                context,
+                "✅ 已关闭能量地址推送服务。如需重新开启，请使用 /start_push 命令。",
+            )
             logger.info(f"已禁用聊天 {chat.id} 的推送服务")
-            
+
         except Exception as e:
             logger.error(f"处理 stop_push 命令时出错: {e}")
             await self._handle_error(update, context, str(e))
@@ -567,31 +607,42 @@ class TronEnergyBot:
             if not await self.check_admin_rights(update, context):
                 await update.message.reply_text("❌ 您没有权限执行此操作，只有管理员可以查看频道列表")
                 return
-                
-            if not self.active_channels:
+
+            channels = await self.push_channel_manager.get_enabled_channels()
+            if not channels:
                 await update.message.reply_text("📋 **活跃频道列表**\n\n暂无活跃频道", parse_mode='Markdown')
                 return
-                
+
             message = "📋 **活跃频道列表**\n\n"
-            message += f"📊 **总数：** {len(self.active_channels)} 个频道\n\n"
-            
-            for i, channel_id in enumerate(self.active_channels, 1):
+            message += f"📊 **总数：** {len(channels)} 个频道\n\n"
+
+            for i, channel in enumerate(channels, 1):
+                channel_id = channel["chat_id"]
+                range_text = self._format_price_range(channel["min_trx"], channel["max_trx"])
                 try:
-                    # 尝试获取频道信息
                     chat = await context.bot.get_chat(channel_id)
                     chat_title = chat.title or f"未知频道 ({channel_id})"
                     chat_type = chat.type
-                    message += f"{i}. **{chat_title}**\n   ID: `{channel_id}`\n   类型: {chat_type}\n\n"
+                    message += (
+                        f"{i}. **{chat_title}**\n"
+                        f"   ID: `{channel_id}`\n"
+                        f"   类型: {chat_type}\n"
+                        f"   筛选: {range_text}\n\n"
+                    )
                 except Exception as e:
-                    # 如果无法获取频道信息，显示错误
-                    message += f"{i}. **无效频道**\n   ID: `{channel_id}`\n   错误: {str(e)[:50]}\n\n"
-                    
+                    message += (
+                        f"{i}. **无效频道**\n"
+                        f"   ID: `{channel_id}`\n"
+                        f"   筛选: {range_text}\n"
+                        f"   错误: {str(e)[:50]}\n\n"
+                    )
+
             message += "📝 **说明：**\n"
             message += "- 使用 `/stop_push` 在对应频道中关闭推送\n"
-            message += "- 无效频道将在下次发送失败时自动移除"
-                
+            message += "- 无效频道将在下次发送失败时自动关闭"
+
             await update.message.reply_text(message, parse_mode='Markdown')
-            
+
         except Exception as e:
             logger.error(f"channels 命令出错: {e}")
             await self._handle_error(update, context, str(e))
@@ -691,45 +742,57 @@ class TronEnergyBot:
         
     async def query_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理/query命令"""
+        wait_message = None
         try:
             user = update.effective_user
             if not user:
                 return
-                
-            # 检查用户冷却时间
+
+            try:
+                min_trx, max_trx = self._parse_price_args(context.args)
+            except ValueError:
+                await update.message.reply_text(
+                    "用法: /query [价格]\n"
+                    "  /query           默认 0.01-1 TRX\n"
+                    "  /query 0.01      精确 0.01 TRX\n"
+                    "  /query 0.01-0.1  区间 0.01-0.1 TRX（含两端）"
+                )
+                return
+
             if not await self._check_user_cooldown(user.id):
                 remaining_time = int(self._min_query_interval - (time.time() - self._user_cooldowns[user.id]))
                 await update.message.reply_text(
                     f"⏳ 请等待 {remaining_time} 秒后再次查询"
                 )
                 return
-                
-            # 使用信号量控制并发
+
+            range_text = self._format_price_range(min_trx, max_trx)
             async with self._query_semaphore:
-                # 更新用户最后查询时间
                 self._user_cooldowns[user.id] = time.time()
-                
-                # 发送等待消息
+
                 wait_message = await update.message.reply_text(
-                    "🔍 正在查找低成本能量代理地址，请稍候..."
+                    f"🔍 正在查找 {range_text} 低价能量地址，请稍候..."
                 )
-                
-                # 执行查找
-                addresses = await self.finder.find_low_cost_energy_addresses()
-                
+
+                addresses = await self.finder.find_low_cost_energy_addresses(
+                    min_trx=min_trx,
+                    max_trx=max_trx,
+                    max_results=3,
+                )
+
                 if not addresses:
-                    await wait_message.edit_text("❌ 未找到符合条件的低价能量地址，请稍后再试")
+                    await wait_message.edit_text(
+                        f"❌ 未找到符合 {range_text} 条件的低价能量地址，请稍后再试"
+                    )
                     return
-                    
-                # 删除等待消息，避免出现额外的时间/提示消息
+
                 try:
                     await wait_message.delete()
                 except Exception:
                     pass
 
-                # 为每条地址单独发送消息，并在顶部包含时间
                 current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                prefix = f"🎯 查询时间：{current_time}\n\n"
+                prefix = f"🎯 查询时间：{current_time}\n筛选：{range_text}\n\n"
                 for addr in addresses:
                     text = prefix + self.format_address_info(addr)
                     markup = self._build_inline_keyboard(addr)
@@ -746,12 +809,15 @@ class TronEnergyBot:
                             disable_web_page_preview=True,
                             reply_markup=markup,
                         )
-            
+
         except Exception as e:
             logger.error(f"查询出错: {e}")
             try:
-                await wait_message.edit_text("❌ 查询过程中出现错误，请稍后重试")
-            except:
+                if wait_message:
+                    await wait_message.edit_text("❌ 查询过程中出现错误，请稍后重试")
+                else:
+                    await update.message.reply_text("❌ 查询过程中出现错误，请稍后重试")
+            except Exception:
                 await update.message.reply_text("❌ 查询过程中出现错误，请稍后重试")
 
     async def inline_button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -974,79 +1040,113 @@ class TronEnergyBot:
         except Exception as e:
             logger.error(f"处理回调失败: {e}")
             
+    async def _disable_invalid_channel(self, chat_id: int, error: Exception) -> None:
+        error_text = str(error)
+        if "Forbidden" not in error_text and "Bad Request" not in error_text:
+            return
+        logger.info(f"关闭无效推送频道: {chat_id} ({error_text})")
+        await self.push_channel_manager.disable_channel(chat_id)
+
+    async def _send_push_results(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        addresses: List[Dict],
+        min_trx: float,
+        max_trx: float,
+        notify_empty: bool,
+    ) -> None:
+        range_text = self._format_price_range(min_trx, max_trx)
+        fresh_addresses = await self.push_channel_manager.filter_fresh_addresses(chat_id, addresses)
+        if not fresh_addresses:
+            if notify_empty:
+                empty_text = (
+                    f"❌ 暂时没有找到符合 {range_text} 的新低价能量地址，稍后将继续为您查询..."
+                )
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=empty_text)
+                except Exception as e:
+                    logger.error(f"发送消息到频道 {chat_id} 失败: {e}")
+                    await self._disable_invalid_channel(chat_id, e)
+            else:
+                logger.info(f"频道 {chat_id} 本轮无新地址，跳过空结果推送")
+            return
+
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        prefix = f"⏰ 定时推送 - {current_time}\n筛选：{range_text}\n\n"
+        sent_addresses: List[str] = []
+        for addr in fresh_addresses:
+            text = prefix + self.format_address_info(addr)
+            markup = self._build_inline_keyboard(addr)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True,
+                    reply_markup=markup,
+                )
+                if addr.get("address"):
+                    sent_addresses.append(addr["address"])
+            except Exception as e:
+                logger.error(f"发送消息到频道 {chat_id} 失败: {e}")
+                await self._disable_invalid_channel(chat_id, e)
+                return
+
+        if sent_addresses:
+            await self.push_channel_manager.mark_pushed(chat_id, sent_addresses)
+
     async def broadcast_addresses(self, context: ContextTypes.DEFAULT_TYPE, specific_chat_id: Optional[int] = None) -> None:
         """向活跃的频道广播地址信息"""
         try:
             logger.info(f"开始广播地址信息 specific_chat_id={specific_chat_id}")
-            
-            # 使用信号量控制并发
-            async with self._query_semaphore:
-                # 如果是定时任务调用且没有活跃频道，直接返回
-                if specific_chat_id is None and not self.active_channels:
+            notify_empty = specific_chat_id is not None
+
+            if specific_chat_id is not None:
+                channel = await self.push_channel_manager.get_channel(specific_chat_id)
+                if not channel or not channel["enabled"]:
+                    logger.info(f"频道 {specific_chat_id} 未启用推送，跳过广播")
+                    return
+                targets = [channel]
+            else:
+                targets = await self.push_channel_manager.get_enabled_channels()
+                if not targets:
                     logger.info("没有活跃的频道，跳过广播")
                     return
-                    
-                addresses = await self.finder.find_low_cost_energy_addresses()
-                
-                if not addresses:
-                    # 如果没找到地址，发送提示消息
-                    message = "❌ 暂时没有找到符合条件的低价能量地址，稍后将继续为您查询..."
-                    if specific_chat_id is not None:
-                        try:
-                            await context.bot.send_message(
-                                chat_id=specific_chat_id,
-                                text=message
-                            )
-                            logger.info(f"发送'未找到地址'消息到频道 {specific_chat_id}")
-                        except Exception as e:
-                            logger.error(f"发送消息到频道 {specific_chat_id} 失败: {e}")
-                    return
-                
-                # 为每条地址发送一条带按钮的消息，时间包含在每条消息顶部
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                prefix = f"⏰ 定时推送 - {current_time}\n\n"
 
-                async def send_to(chat_id: int):
-                    for addr in addresses:
-                        text = prefix + self.format_address_info(addr)
-                        markup = self._build_inline_keyboard(addr)
-                        try:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=text,
-                                parse_mode='Markdown',
-                                disable_web_page_preview=True,
-                                reply_markup=markup,
-                            )
-                        except Exception as e:
-                            logger.error(f"发送消息到频道 {chat_id} 失败: {e}")
-                            # 如果是因为机器人被屏蔽或频道不存在，从活跃列表中移除
-                            if "Forbidden" in str(e) or "Bad Request" in str(e):
-                                logger.info(f"从活跃频道列表中移除无效频道: {chat_id}")
-                                self.active_channels.discard(chat_id)
+            grouped: Dict[tuple, List[Dict]] = defaultdict(list)
+            for channel in targets:
+                key = (round(channel["min_trx"], 4), round(channel["max_trx"], 4))
+                grouped[key].append(channel)
 
-                if specific_chat_id is not None:
-                    await send_to(specific_chat_id)
-                    return
+            async with self._query_semaphore:
+                for (min_trx, max_trx), channels in grouped.items():
+                    addresses = await self.finder.find_low_cost_energy_addresses(
+                        min_trx=min_trx,
+                        max_trx=max_trx,
+                        max_results=3,
+                    )
+                    for channel in channels:
+                        await self._send_push_results(
+                            context,
+                            channel["chat_id"],
+                            addresses,
+                            min_trx,
+                            max_trx,
+                            notify_empty=notify_empty,
+                        )
 
-                for channel_id in self.active_channels:
-                    await send_to(channel_id)
-            
         except Exception as e:
             logger.error(f"广播地址时出错: {e}")
-            
+
     async def handle_new_chat_members(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理机器人被添加到新频道的事件"""
         try:
+            if not update.message:
+                return
             chat = update.message.chat
             if chat.type in ['channel', 'supergroup']:
-                if chat.id not in self.subscribed_channels:
-                    self.subscribed_channels.append(chat.id)
-                    logger.info(f"机器人被添加到新频道: {chat.id}")
-                    
-                    # 立即发送一次地址信息
-                    await self.broadcast_addresses()
-                    
+                logger.info(f"机器人被添加到新频道: {chat.id}，等待管理员执行 /start_push")
         except Exception as e:
             logger.error(f"处理新成员事件时出错: {e}")
             
