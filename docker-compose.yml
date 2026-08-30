@@ -16,10 +16,11 @@ services:
       retries: 10
 
   bot:
+    image: ${IMAGE_NAME:-ghcr.io/lookoupai/low-price-tron-energy:latest}
+    pull_policy: ${PULL_POLICY:-always}
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${IMAGE_NAME:-low-price-tron-energy:local}
     restart: unless-stopped
     network_mode: host
     env_file:

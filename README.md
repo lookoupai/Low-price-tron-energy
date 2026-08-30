@@ -83,43 +83,42 @@ telegram频道：https://t.me/lowtron
 
 ## 环境要求
 
-- Python 3.8 或更高版本（本地运行）
 - Docker / Docker Compose（推荐）
-- 操作系统：Windows/Linux/MacOS
+- 或 Python 3.8+（不使用 Docker 时）
+- PostgreSQL：默认用远程库（如 Supabase）；也可用本仓库自带 Postgres
 
-## 推荐：Docker 运行
+## 推荐：用 GitHub 镜像运行
 
-1. 复制配置文件并填写密钥：
+推送到 `main` 后，GitHub Actions 会构建并发布：
+
+`ghcr.io/lookoupai/low-price-tron-energy:latest`
+
+`docker compose up -d` **默认拉取这个镜像**，不会在本机构建。
+
+1. 复制配置并填写密钥：
 
    ```bash
    cp .env.example .env
    ```
 
-   必填项：
-   - `TRON_API_KEY_1`：TronScan API Key（https://tronscan.org/#/developer/api）
-   - `TELEGRAM_BOT_TOKEN`：与 @BotFather 创建机器人后获得
+   必填：
+   - `TRON_API_KEY_1`：https://tronscan.org/#/developer/api
+   - `TELEGRAM_BOT_TOKEN`：找 `@BotFather` 创建机器人
+   - `DATABASE_URL`：远程 PostgreSQL 连接串（推荐继续用 Supabase）
 
    可选：
    - `MIN_TRX_AMOUNT` / `MAX_TRX_AMOUNT`：筛选区间，默认 `0.01` / `1`
-   - `BOT_ADVERTISEMENT`：消息底部广告
-   - `POSTGRES_*`：本地 Postgres 账号，默认即可
+   - `BOT_ADVERTISEMENT`：消息底部广告。内容里有 `@` 时必须加引号，例如 `"查询机器人 @lowtronbot"`
 
-2. 启动：
+2. 如果 GHCR 包是私有的，先登录再启动：
 
    ```bash
-   docker compose up -d --build
+   echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+   docker compose up -d
    docker compose logs -f bot
    ```
 
-   Compose 默认只启动机器人，使用 `.env` 里的远程 `DATABASE_URL`（例如 Supabase）。
-   本机 Docker 默认走 IPv4，而部分云数据库只有 IPv6，因此 bot 使用 `network_mode: host`。
-   黑名单/白名单表会在首次使用时自动创建。
-
-   如需本地 Postgres：
-
-   ```bash
-   docker compose --profile local-db up -d
-   ```
+   公开包可直接 `docker compose up -d`。
 
 3. 停止：
 
@@ -127,25 +126,50 @@ telegram频道：https://t.me/lowtron
    docker compose down
    ```
 
-数据卷：
-- `postgres_data`：黑名单/白名单/设置
-- `results_data`：查询结果文件
+说明：
+- Compose 默认只启动 `bot`，数据库用 `.env` 里的远程 `DATABASE_URL`
+- 部分云数据库只有 IPv6，本机 Docker 桥接网络可能连不上，所以 bot 使用 `network_mode: host`
+- 黑名单/白名单表会在首次使用时自动创建
+- 查询结果保存在 Docker 卷 `results_data`
 
-## 使用已发布镜像
+## 本地改代码时构建镜像
 
-GitHub Actions 会在推送到 `main` 后构建镜像并发布到 GHCR：
-
-```bash
-docker pull ghcr.io/lookoupai/low-price-tron-energy:latest
-```
-
-单独跑镜像时仍需提供 Postgres（可用本仓库 `docker-compose.yml`，或把 `IMAGE_NAME` 指到已发布镜像）：
+开发或还没推送到 GitHub 时，才需要本机构建：
 
 ```bash
-IMAGE_NAME=ghcr.io/lookoupai/low-price-tron-energy:latest docker compose up -d
+docker compose up -d --build
 ```
 
-仓库需开启 GitHub Packages 写入权限（Settings → Actions → General → Workflow permissions → Read and write）。
+指定本机镜像、且不要每次都去拉 GHCR：
+
+```bash
+IMAGE_NAME=low-price-tron-energy:local PULL_POLICY=never docker compose up -d --build
+```
+
+## 使用本地 Postgres
+
+没有远程库时：
+
+```bash
+docker compose --profile local-db up -d
+```
+
+同时把 `.env` 的 `DATABASE_URL` 改成：
+
+```
+DATABASE_URL=postgresql://tron:tron_energy_pass@127.0.0.1:5432/tron_energy
+```
+
+因为 bot 走 host 网络，这里要用 `127.0.0.1`，不能用 compose 服务名 `db`。
+
+## GitHub 镜像发布
+
+工作流：`.github/workflows/docker-publish.yml`
+
+- 触发：推送 `main`、打 `v*` 标签、手动运行
+- 镜像：`ghcr.io/lookoupai/low-price-tron-energy:latest`
+
+仓库需要打开 Packages 写入权限：Settings → Actions → General → Workflow permissions → Read and write。
 
 ## 本地 Python 运行
 
@@ -171,8 +195,8 @@ IMAGE_NAME=ghcr.io/lookoupai/low-price-tron-energy:latest docker compose up -d
      # Telegram Bot Token
      TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 
-     # 广告内容（可选）
-     BOT_ADVERTISEMENT=your_advertisement_here
+     # 广告内容（可选，含 @ 时必须加引号）
+     BOT_ADVERTISEMENT="查询机器人 @lowtronbot"
 
      # 筛选区间（默认 0.01-1 TRX）
      MIN_TRX_AMOUNT=0.01
