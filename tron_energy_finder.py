@@ -114,9 +114,14 @@ class TronEnergyFinder:
             raise ValueError("请在.env文件中设置至少一个 TRON_API_KEY")
         
         logger.info(f"成功加载 {len(api_keys)} 个 API Key")  # 保留重要信息为 INFO 级别
-        
+
         self.api_manager = APIKeyManager(api_keys)
         self.tronscan_api = "https://apilist.tronscan.org/api"
+        self.min_trx_amount = float(os.getenv("MIN_TRX_AMOUNT", "0.01"))
+        self.max_trx_amount = float(os.getenv("MAX_TRX_AMOUNT", "1"))
+        if self.min_trx_amount <= 0 or self.max_trx_amount < self.min_trx_amount:
+            raise ValueError("MIN_TRX_AMOUNT / MAX_TRX_AMOUNT 配置无效")
+        logger.info(f"TRX 筛选区间: {self.min_trx_amount}-{self.max_trx_amount} TRX")
         
         # 创建results目录
         self.results_dir = pathlib.Path("results")
@@ -150,7 +155,11 @@ class TronEnergyFinder:
         self._blacklist_manager = None
         # 白名单管理器（延迟初始化）
         self._whitelist_manager = None
-        
+
+    def _is_rental_amount(self, amount: float) -> bool:
+        """判断金额是否落在低价租能量区间"""
+        return self.min_trx_amount <= amount <= self.max_trx_amount
+
     def _build_ssl_context(self) -> ssl.SSLContext:
         """构建SSL上下文，解决证书验证问题"""
         try:
@@ -539,7 +548,7 @@ class TronEnergyFinder:
                                 try:
                                     amount = float(prev_tx.get("amount", 0)) / 1_000_000
                                     amount = round(amount, 4)
-                                    if 0.1 <= amount <= 1:
+                                    if self._is_rental_amount(amount):
                                         trx_receiver = prev_tx.get("toAddress")
                                         
                                         # 获取收款地址的最近交易记录
@@ -570,7 +579,7 @@ class TronEnergyFinder:
                                                 try:
                                                     rtx_amount = float(rtx.get("amount", 0)) / 1_000_000
                                                     rtx_amount = round(rtx_amount, 4)
-                                                    if 0.1 <= rtx_amount <= 1:
+                                                    if self._is_rental_amount(rtx_amount):
                                                         amount_count[rtx_amount] = amount_count.get(rtx_amount, 0) + 1
                                                         total_count += 1
                                                 except (ValueError, TypeError):

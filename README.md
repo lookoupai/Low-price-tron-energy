@@ -1,6 +1,6 @@
 # Tron 能量查找机器人
 
-这是一个用于查找低成本 Tron 能量代理地址的 Telegram 机器人。机器人可以自动查找并推送最新的低价能量代理地址信息。
+这是一个用于查找低成本 Tron 能量代理地址的 Telegram 机器人。机器人可以自动查找并推送最新的低价能量代理地址信息。当前默认筛选区间为 **0.01-1 TRX**。
 
 ## 演示
 telegram机器人：https://t.me/lowtronbot
@@ -83,10 +83,71 @@ telegram频道：https://t.me/lowtron
 
 ## 环境要求
 
-- Python 3.8 或更高版本
+- Python 3.8 或更高版本（本地运行）
+- Docker / Docker Compose（推荐）
 - 操作系统：Windows/Linux/MacOS
 
-## 安装步骤
+## 推荐：Docker 运行
+
+1. 复制配置文件并填写密钥：
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   必填项：
+   - `TRON_API_KEY_1`：TronScan API Key（https://tronscan.org/#/developer/api）
+   - `TELEGRAM_BOT_TOKEN`：与 @BotFather 创建机器人后获得
+
+   可选：
+   - `MIN_TRX_AMOUNT` / `MAX_TRX_AMOUNT`：筛选区间，默认 `0.01` / `1`
+   - `BOT_ADVERTISEMENT`：消息底部广告
+   - `POSTGRES_*`：本地 Postgres 账号，默认即可
+
+2. 启动：
+
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f bot
+   ```
+
+   Compose 默认只启动机器人，使用 `.env` 里的远程 `DATABASE_URL`（例如 Supabase）。
+   本机 Docker 默认走 IPv4，而部分云数据库只有 IPv6，因此 bot 使用 `network_mode: host`。
+   黑名单/白名单表会在首次使用时自动创建。
+
+   如需本地 Postgres：
+
+   ```bash
+   docker compose --profile local-db up -d
+   ```
+
+3. 停止：
+
+   ```bash
+   docker compose down
+   ```
+
+数据卷：
+- `postgres_data`：黑名单/白名单/设置
+- `results_data`：查询结果文件
+
+## 使用已发布镜像
+
+GitHub Actions 会在推送到 `main` 后构建镜像并发布到 GHCR：
+
+```bash
+docker pull ghcr.io/lookoupai/low-price-tron-energy:latest
+```
+
+单独跑镜像时仍需提供 Postgres（可用本仓库 `docker-compose.yml`，或把 `IMAGE_NAME` 指到已发布镜像）：
+
+```bash
+IMAGE_NAME=ghcr.io/lookoupai/low-price-tron-energy:latest docker compose up -d
+```
+
+仓库需开启 GitHub Packages 写入权限（Settings → Actions → General → Workflow permissions → Read and write）。
+
+## 本地 Python 运行
 
 1. 克隆代码仓库：
    ```bash
@@ -106,13 +167,17 @@ telegram频道：https://t.me/lowtron
      # TronScan API Keys
      TRON_API_KEY_1=your_first_api_key_here
      TRON_API_KEY_2=your_second_api_key_here
-     
+
      # Telegram Bot Token
      TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-     
+
      # 广告内容（可选）
      BOT_ADVERTISEMENT=your_advertisement_here
-     
+
+     # 筛选区间（默认 0.01-1 TRX）
+     MIN_TRX_AMOUNT=0.01
+     MAX_TRX_AMOUNT=1
+
      # 数据库连接（黑名单功能）
      DATABASE_URL=postgresql://username:password@host:port/database
      ```

@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:16-alpine
+    profiles: ["local-db"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tron_energy}
+      POSTGRES_USER: ${POSTGRES_USER:-tron}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tron_energy_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-tron} -d ${POSTGRES_DB:-tron_energy}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${IMAGE_NAME:-low-price-tron-energy:local}
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      MIN_TRX_AMOUNT: ${MIN_TRX_AMOUNT:-0.01}
+      MAX_TRX_AMOUNT: ${MAX_TRX_AMOUNT:-1}
+    volumes:
+      - results_data:/app/results
+
+volumes:
+  postgres_data:
+  results_data:
