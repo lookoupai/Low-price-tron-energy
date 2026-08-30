@@ -14,13 +14,19 @@ telegram频道：https://t.me/lowtron
 1. **私聊功能**
    - `/start` - 开始使用机器人
    - `/help` - 查看帮助信息
-   - `/query` - 立即查询低价能量地址
+   - `/query` - 查找低价能量地址（默认 0.01-1 TRX，最多 3 条）
+   - `/query 0.01` - 精确查找 0.01 TRX
+   - `/query 0.01-0.1` - 查找 0.01-0.1 TRX
 
 2. **频道/群组功能**
-   - `/start_push` - 开启定时推送（仅管理员可用）
+   - `/start_push` - 开启定时推送（默认 0.01-1 TRX，仅管理员可用）
+   - `/start_push 0.01` - 按精确价格推送
+   - `/start_push 0.01-0.1` - 按价格区间推送
    - `/stop_push` - 关闭定时推送（仅管理员可用）
    - `/query` - 立即查询一次
-   - 开启推送后每小时自动推送最新地址
+   - `/channels` - 查看已启用推送的频道及其价格筛选
+   - 订阅写入数据库，容器重启后不会丢失
+   - 开启推送后每小时自动推送最新地址（最多 3 条，6 小时内不重复推同一收款地址）
 
 3. **黑名单功能（优化）**
    - `/blacklist_add <地址> [原因]` - 添加地址到黑名单
@@ -108,6 +114,7 @@ telegram频道：https://t.me/lowtron
 
    可选：
    - `MIN_TRX_AMOUNT` / `MAX_TRX_AMOUNT`：筛选区间，默认 `0.01` / `1`
+   - `TZ`：时区，默认 `Asia/Shanghai`（查询/推送时间和日志都用这个时区，不是 UTC）
    - `BOT_ADVERTISEMENT`：消息底部广告。内容里有 `@` 时必须加引号，例如 `"查询机器人 @lowtronbot"`
 
 2. 如果 GHCR 包是私有的，先登录再启动：
@@ -129,7 +136,8 @@ telegram频道：https://t.me/lowtron
 说明：
 - Compose 默认只启动 `bot`，数据库用 `.env` 里的远程 `DATABASE_URL`
 - 部分云数据库只有 IPv6，本机 Docker 桥接网络可能连不上，所以 bot 使用 `network_mode: host`
-- 黑名单/白名单表会在首次使用时自动创建
+- 容器时区默认 `Asia/Shanghai`，查询/推送消息里的时间和日志都按上海时间显示
+- 黑名单/白名单/推送订阅表会在首次使用时自动创建
 - 查询结果保存在 Docker 卷 `results_data`
 
 ## 本地改代码时构建镜像
@@ -195,6 +203,9 @@ DATABASE_URL=postgresql://tron:tron_energy_pass@127.0.0.1:5432/tron_energy
      # Telegram Bot Token
      TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 
+     # 时区（默认上海时间）
+     TZ=Asia/Shanghai
+
      # 广告内容（可选，含 @ 时必须加引号）
      BOT_ADVERTISEMENT="查询机器人 @lowtronbot"
 
@@ -227,13 +238,15 @@ DATABASE_URL=postgresql://tron:tron_energy_pass@127.0.0.1:5432/tron_energy
 3. **使用机器人**
    - 私聊使用：
      1. 直接向机器人发送命令
-     2. 使用 `/query` 立即查询地址
+     2. 使用 `/query` 查询默认区间，或 `/query 0.01` / `/query 0.01-0.1` 指定价格
    
    - 频道/群组使用：
      1. 将机器人添加到频道/群组并设置为管理员
-     2. 使用 `/start_push` 开启定时推送
+     2. 使用 `/start_push`、`/start_push 0.01` 或 `/start_push 0.01-0.1` 开启定时推送
      3. 使用 `/stop_push` 关闭定时推送
      4. 使用 `/query` 立即查询一次
+     5. 使用 `/channels` 查看已启用推送的频道及其价格筛选
+     6. 拉机器人进频道不会自动开推送，需管理员手动执行 `/start_push`
    
    - 名单功能与交互按钮使用：
      1. 发送 `/blacklist_add TXxxxxxxxx 原因` 添加可疑地址
@@ -261,6 +274,7 @@ DATABASE_URL=postgresql://tron:tron_energy_pass@127.0.0.1:5432/tron_energy
 5. **数据库配置**：功能需要配置 PostgreSQL 连接，推荐使用 Supabase
 6. **白名单优先**：组合白名单会覆盖黑名单警告；仅单方白名单时将与黑名单同时展示并给出综合建议
 7. **临时状态**：1票反馈即生效并标注“（临时）”，后续可由更多反馈或管理员操作转为正式；撤回功能将于后续版本开放
+8. **时区**：Docker 默认使用 `Asia/Shanghai`。如果消息时间差 8 小时，检查容器环境变量 `TZ`
 
 ## 技术支持
 

@@ -26,6 +26,7 @@ services:
     env_file:
       - .env
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       MIN_TRX_AMOUNT: ${MIN_TRX_AMOUNT:-0.01}
       MAX_TRX_AMOUNT: ${MAX_TRX_AMOUNT:-1}
     volumes:
