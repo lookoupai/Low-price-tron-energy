@@ -1047,9 +1047,20 @@ class TronEnergyFinder:
                 paired = self._pair_transactions_in_block(payments, proxies, lo, hi)
                 logger.info(f"块内预配对找到 {len(paired)} 个候选接收方")
 
-                # 并发分析配对成功的接收方
+                # 优先分析配对成功的接收方，如果不够则分析所有代理接收方
+                candidates = set(paired.keys())
+                if len(candidates) < len(proxies):
+                    for proxy in proxies:
+                        contract_data = proxy.get("contractData", {})
+                        receiver = contract_data.get("receiver_address")
+                        if receiver:
+                            candidates.add(receiver)
+
+                logger.info(f"总候选接收方: {len(candidates)} 个（{len(paired)} 个块内配对 + {len(candidates) - len(paired)} 个未配对）")
+
+                # 并发分析候选接收方
                 tasks = []
-                for receiver in paired.keys():
+                for receiver in candidates:
                     if len(found_addresses) >= max_results:
                         break
                     task = self.analyze_address(
