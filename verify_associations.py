@@ -14,67 +14,56 @@
 """
 
 import asyncio
-import asyncpg
 import argparse
 import csv
-import os
 import sys
 from datetime import datetime
 from typing import Dict, List
-from dotenv import load_dotenv
-
-# 加载环境变量
-load_dotenv()
+from db import get_db_pool, close_db_pool
 
 
 class AssociationVerifier:
     """地址关联数据验证器"""
-    
+
     def __init__(self):
-        self.database_url = os.getenv("DATABASE_URL")
-        if not self.database_url:
-            raise ValueError("请在.env文件中设置DATABASE_URL")
-        self._connection_pool = None
-        
+        pass
+
     async def init_database(self):
         """初始化数据库连接"""
         try:
-            self._connection_pool = await asyncpg.create_pool(
-                self.database_url,
-                min_size=1,
-                max_size=5,
-                command_timeout=30
-            )
+            await get_db_pool()
             print("✅ 数据库连接成功")
         except Exception as e:
             print(f"❌ 数据库连接失败: {e}")
             raise
-            
+
     async def check_table_exists(self, table_name: str) -> bool:
         """检查表是否存在"""
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             result = await conn.fetchval(
                 """
                 SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
+                    SELECT FROM information_schema.tables
                     WHERE table_name = $1
                 )
                 """,
                 table_name
             )
             return result
-            
+
     async def get_comprehensive_stats(self) -> Dict:
         """获取全面的数据统计"""
         stats = {}
-        
-        async with self._connection_pool.acquire() as conn:
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             # 检查表是否存在
             tables = ['blacklist', 'blacklist_associations', 'whitelist', 'whitelist_pairs', 'bot_settings']
             for table in tables:
                 exists = await self.check_table_exists(table)
                 stats[f'{table}_exists'] = exists
-                
+
             # 如果表存在，获取统计信息
             if stats.get('blacklist_exists'):
                 # 黑名单统计
@@ -123,13 +112,14 @@ class AssociationVerifier:
                 stats['association_enabled'] = association_enabled
                 
         return stats
-        
+
     async def get_recent_associations(self, limit: int = 10) -> List[Dict]:
         """获取最近的关联记录"""
         if not await self.check_table_exists('blacklist_associations'):
             return []
-            
-        async with self._connection_pool.acquire() as conn:
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT source_address, target_address, created_at
@@ -140,13 +130,14 @@ class AssociationVerifier:
                 limit
             )
             return [dict(row) for row in rows]
-            
+
     async def get_recent_auto_blacklist(self, limit: int = 10) -> List[Dict]:
         """获取最近的自动黑名单记录"""
         if not await self.check_table_exists('blacklist'):
             return []
-            
-        async with self._connection_pool.acquire() as conn:
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT address, reason, added_at, is_provisional
@@ -158,19 +149,22 @@ class AssociationVerifier:
                 limit
             )
             return [dict(row) for row in rows]
-            
+
     async def export_to_csv(self, output_dir: str = "exports") -> List[str]:
         """导出数据到CSV文件"""
+        import os
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-            
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         exported_files = []
-        
+
+        pool = await get_db_pool()
+
         # 导出黑名单
         if await self.check_table_exists('blacklist'):
             filename = f"{output_dir}/blacklist_{timestamp}.csv"
-            async with self._connection_pool.acquire() as conn:
+            async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT * FROM blacklist WHERE is_active = true ORDER BY added_at DESC"
                 )
@@ -182,15 +176,15 @@ class AssociationVerifier:
                     for row in rows:
                         writer.writerow(dict(row))
             exported_files.append(filename)
-            
+
         # 导出关联记录
         if await self.check_table_exists('blacklist_associations'):
             filename = f"{output_dir}/associations_{timestamp}.csv"
-            async with self._connection_pool.acquire() as conn:
+            async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT * FROM blacklist_associations ORDER BY created_at DESC"
                 )
-                
+
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 if rows:
                     writer = csv.DictWriter(f, fieldnames=rows[0].keys())
@@ -198,15 +192,15 @@ class AssociationVerifier:
                     for row in rows:
                         writer.writerow(dict(row))
             exported_files.append(filename)
-            
+
         # 导出白名单
         if await self.check_table_exists('whitelist'):
             filename = f"{output_dir}/whitelist_{timestamp}.csv"
-            async with self._connection_pool.acquire() as conn:
+            async with pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT * FROM whitelist WHERE is_active = true ORDER BY added_at DESC"
                 )
-                
+
             with open(filename, 'w', newline='', encoding='utf-8') as f:
                 if rows:
                     writer = csv.DictWriter(f, fieldnames=rows[0].keys())
@@ -214,13 +208,12 @@ class AssociationVerifier:
                     for row in rows:
                         writer.writerow(dict(row))
             exported_files.append(filename)
-            
+
         return exported_files
-        
+
     async def close(self):
-        """关闭数据库连接"""
-        if self._connection_pool:
-            await self._connection_pool.close()
+        """关闭方法保留以兼容现有代码，实际连接池由 db.py 统一管理"""
+        pass
 
 
 async def main():
@@ -228,9 +221,9 @@ async def main():
     parser = argparse.ArgumentParser(description="验证地址关联数据状态脚本")
     parser.add_argument("--detailed", action="store_true", help="显示详细信息")
     parser.add_argument("--export", action="store_true", help="导出数据到CSV文件")
-    
+
     args = parser.parse_args()
-    
+
     try:
         verifier = AssociationVerifier()
         await verifier.init_database()
@@ -328,12 +321,12 @@ async def main():
                     print(f"     - {file}")
             else:
                 print("   无数据可导出")
-                
+
         print("\n" + "=" * 50)
         print("✅ 验证完成")
-        
-        await verifier.close()
-        
+
+        await close_db_pool()
+
     except Exception as e:
         print(f"❌ 验证失败: {e}")
         sys.exit(1)

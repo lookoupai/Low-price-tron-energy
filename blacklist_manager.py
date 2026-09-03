@@ -7,8 +7,8 @@ from cachetools import TTLCache
 import os
 from dotenv import load_dotenv
 from settings_manager import SettingsManager
+from db import get_db_pool
 
-# 加载环境变量
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -16,37 +16,22 @@ logger = logging.getLogger(__name__)
 class BlacklistManager:
     def __init__(self):
         """初始化黑名单管理器"""
-        self.database_url = os.getenv("DATABASE_URL")
-        if not self.database_url:
-            raise ValueError("请在.env文件中设置DATABASE_URL")
-        
-        # 黑名单缓存，TTL为5分钟
         self._blacklist_cache = TTLCache(maxsize=1000, ttl=300)
-        self._connection_pool = None
         self._settings_manager: Optional[SettingsManager] = None
-        
+
     async def init_database(self):
         """初始化数据库连接池和表结构"""
         try:
-            # 创建连接池
-            self._connection_pool = await asyncpg.create_pool(
-                self.database_url,
-                min_size=1,
-                max_size=10,
-                command_timeout=30
-            )
-            
-            # 创建表结构
-            await self._create_tables()
+            pool = await get_db_pool()
+            await self._create_tables(pool)
             logger.info("数据库初始化成功")
-            
         except Exception as e:
             logger.error(f"数据库初始化失败: {e}")
             raise
-            
-    async def _create_tables(self):
+
+    async def _create_tables(self, pool: asyncpg.Pool):
         """创建数据库表结构"""
-        async with self._connection_pool.acquire() as connection:
+        async with pool.acquire() as connection:
             # 创建黑名单表
             await connection.execute('''
                 CREATE TABLE IF NOT EXISTS blacklist (
@@ -89,15 +74,11 @@ class BlacklistManager:
                              is_provisional: bool = False) -> bool:
         """添加地址到黑名单"""
         try:
-            # 验证地址格式
             if not self._validate_tron_address(address):
                 return False
-                
-            # 确保数据库连接池已初始化
-            if self._connection_pool is None:
-                await self.init_database()
-                
-            async with self._connection_pool.acquire() as connection:
+
+            pool = await get_db_pool()
+            async with pool.acquire() as connection:
                 await connection.execute('''
                     INSERT INTO blacklist (address, reason, type, added_by, is_provisional)
                     VALUES ($1, $2, $3, $4, $5)
@@ -122,19 +103,14 @@ class BlacklistManager:
     async def check_blacklist(self, address: str) -> Optional[Dict]:
         """检查地址是否在黑名单中"""
         try:
-            # 先检查缓存
             if address in self._blacklist_cache:
                 return self._blacklist_cache[address]
-                
-            # 验证地址格式
+
             if not self._validate_tron_address(address):
                 return None
-                
-            # 确保数据库连接池已初始化
-            if self._connection_pool is None:
-                await self.init_database()
-                
-            async with self._connection_pool.acquire() as connection:
+
+            pool = await get_db_pool()
+            async with pool.acquire() as connection:
                 result = await connection.fetchrow('''
                     SELECT address, reason, type, added_by, added_at, is_active, is_provisional
                     FROM blacklist 
@@ -166,11 +142,8 @@ class BlacklistManager:
     async def remove_from_blacklist(self, address: str) -> bool:
         """从黑名单中移除地址"""
         try:
-            # 确保数据库连接池已初始化
-            if self._connection_pool is None:
-                await self.init_database()
-                
-            async with self._connection_pool.acquire() as connection:
+            pool = await get_db_pool()
+            async with pool.acquire() as connection:
                 result = await connection.execute('''
                     UPDATE blacklist 
                     SET is_active = false 
@@ -187,14 +160,29 @@ class BlacklistManager:
             logger.error(f"移除黑名单失败: {e}")
             return False
             
+    async def set_provisional(self, address: str, is_provisional: bool) -> bool:
+        """仅更新临时标记，不改动其它字段"""
+        try:
+            pool = await get_db_pool()
+            async with pool.acquire() as connection:
+                await connection.execute('''
+                    UPDATE blacklist
+                    SET is_provisional = $2
+                    WHERE address = $1
+                ''', address, is_provisional)
+
+            self._blacklist_cache.pop(address, None)
+            return True
+
+        except Exception as e:
+            logger.error(f"更新黑名单临时标记失败: {e}")
+            return False
+
     async def add_association(self, source_address: str, target_address: str) -> bool:
         """添加地址关联记录"""
         try:
-            # 确保数据库连接池已初始化
-            if self._connection_pool is None:
-                await self.init_database()
-                
-            async with self._connection_pool.acquire() as connection:
+            pool = await get_db_pool()
+            async with pool.acquire() as connection:
                 await connection.execute('''
                     INSERT INTO blacklist_associations (source_address, target_address)
                     VALUES ($1, $2)
@@ -256,11 +244,8 @@ class BlacklistManager:
     async def get_blacklist_stats(self) -> Dict:
         """获取黑名单统计信息"""
         try:
-            # 确保数据库连接池已初始化
-            if self._connection_pool is None:
-                await self.init_database()
-                
-            async with self._connection_pool.acquire() as connection:
+            pool = await get_db_pool()
+            async with pool.acquire() as connection:
                 result = await connection.fetchrow('''
                     SELECT 
                         COUNT(*) as total,
@@ -293,9 +278,8 @@ class BlacklistManager:
             return bool(re.match(pattern, address))
             
         return False
-        
+
     async def close(self):
-        """关闭数据库连接池"""
-        if self._connection_pool:
-            await self._connection_pool.close()
-            logger.info("数据库连接池已关闭") 
+        """关闭方法保留以兼容现有代码，实际连接池由 db.py 统一管理"""
+        pass
+ 

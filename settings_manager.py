@@ -1,8 +1,7 @@
 import asyncpg
 import logging
-import os
 from typing import Optional
-from dotenv import load_dotenv
+from db import get_db_pool
 
 
 logger = logging.getLogger(__name__)
@@ -16,25 +15,15 @@ class SettingsManager:
     """
 
     def __init__(self) -> None:
-        load_dotenv()
-        self.database_url = os.getenv("DATABASE_URL")
-        if not self.database_url:
-            raise ValueError("请在.env文件中设置DATABASE_URL")
-        self._connection_pool: Optional[asyncpg.pool.Pool] = None
+        pass
 
     async def init_database(self) -> None:
-        """初始化连接池和表结构"""
-        self._connection_pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=1,
-            max_size=5,
-            command_timeout=30,
-        )
-        await self._create_tables()
+        """初始化表结构"""
+        pool = await get_db_pool()
+        await self._create_tables(pool)
 
-    async def _create_tables(self) -> None:
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+    async def _create_tables(self, pool: asyncpg.Pool) -> None:
+        async with pool.acquire() as conn:
             # 设置表
             await conn.execute(
                 """
@@ -56,10 +45,8 @@ class SettingsManager:
             )
 
     async def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT value FROM bot_settings WHERE key = $1", key
             )
@@ -68,10 +55,8 @@ class SettingsManager:
             return default
 
     async def set(self, key: str, value: str) -> None:
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO bot_settings (key, value, updated_at)
@@ -91,8 +76,7 @@ class SettingsManager:
         await self.set("blacklist_association_enabled", "true" if enabled else "false")
 
     async def close(self) -> None:
-        if self._connection_pool:
-            await self._connection_pool.close()
-            logger.info("设置连接池已关闭")
+        """关闭方法保留以兼容现有代码，实际连接池由 db.py 统一管理"""
+        pass
 
 

@@ -1,41 +1,29 @@
 import asyncpg
 import logging
-import os
 from typing import Dict, Optional
 from cachetools import TTLCache
-from dotenv import load_dotenv
+from db import get_db_pool
 
 
 logger = logging.getLogger(__name__)
 
 
 class WhitelistManager:
-    """白名单管理器
+    “””白名单管理器
 
     管理收款地址、能量提供方以及两者组合的白名单记录。
-    支持“临时”标记，用于1票即时生效的场景。
-    """
+    支持”临时”标记，用于1票即时生效的场景。
+    “””
 
     def __init__(self) -> None:
-        load_dotenv()
-        self.database_url = os.getenv("DATABASE_URL")
-        if not self.database_url:
-            raise ValueError("请在.env文件中设置DATABASE_URL")
-        self._connection_pool: Optional[asyncpg.pool.Pool] = None
         self._cache = TTLCache(maxsize=2000, ttl=300)
 
     async def init_database(self) -> None:
-        self._connection_pool = await asyncpg.create_pool(
-            self.database_url,
-            min_size=1,
-            max_size=10,
-            command_timeout=30,
-        )
-        await self._create_tables()
+        pool = await get_db_pool()
+        await self._create_tables(pool)
 
-    async def _create_tables(self) -> None:
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+    async def _create_tables(self, pool: asyncpg.Pool) -> None:
+        async with pool.acquire() as conn:
             # 单地址白名单
             await conn.execute(
                 """
@@ -89,10 +77,8 @@ class WhitelistManager:
             return False
         if address_type not in ("payment", "provider"):
             return False
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO whitelist (address, address_type, reason, added_by, is_provisional)
@@ -116,10 +102,8 @@ class WhitelistManager:
         return True
 
     async def remove_address(self, address: str, address_type: str) -> bool:
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE whitelist SET is_active = false WHERE address = $1 AND address_type = $2",
                 address,
@@ -132,10 +116,8 @@ class WhitelistManager:
         cache_key = (address, address_type)
         if cache_key in self._cache:
             return self._cache[cache_key]
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT address, address_type, reason, added_by, added_at, is_active, is_provisional, success_count
@@ -155,10 +137,8 @@ class WhitelistManager:
     async def add_pair(self, payment_address: str, provider_address: str, added_by: Optional[int], is_provisional: bool = True) -> bool:
         if not (self._validate_tron_address(payment_address) and self._validate_tron_address(provider_address)):
             return False
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO whitelist_pairs (payment_address, provider_address, is_provisional, added_by)
@@ -179,10 +159,8 @@ class WhitelistManager:
         return True
 
     async def check_pair(self, payment_address: str, provider_address: str) -> Optional[Dict]:
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT payment_address, provider_address, success_count, last_success_time, is_active, is_provisional, added_by, created_at
@@ -194,11 +172,43 @@ class WhitelistManager:
             )
             return dict(row) if row else None
 
+    async def remove_pair(self, payment_address: str, provider_address: str) -> bool:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE whitelist_pairs SET is_active = false WHERE payment_address = $1 AND provider_address = $2",
+                payment_address,
+                provider_address,
+            )
+        return True
+
+    async def set_provisional(self, address: str, address_type: str, is_provisional: bool) -> bool:
+        """仅更新临时标记，不叠加 success_count"""
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE whitelist SET is_provisional = $3 WHERE address = $1 AND address_type = $2",
+                address,
+                address_type,
+                is_provisional,
+            )
+        self._cache.pop((address, address_type), None)
+        return True
+
+    async def set_pair_provisional(self, payment_address: str, provider_address: str, is_provisional: bool) -> bool:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE whitelist_pairs SET is_provisional = $3 WHERE payment_address = $1 AND provider_address = $2",
+                payment_address,
+                provider_address,
+                is_provisional,
+            )
+        return True
+
     async def get_stats(self) -> Dict:
-        if self._connection_pool is None:
-            await self.init_database()
-        assert self._connection_pool is not None
-        async with self._connection_pool.acquire() as conn:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
             row1 = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM whitelist WHERE is_active = true")
             row2 = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM whitelist_pairs WHERE is_active = true")
             return {
@@ -216,8 +226,7 @@ class WhitelistManager:
         return False
 
     async def close(self) -> None:
-        if self._connection_pool:
-            await self._connection_pool.close()
-            logger.info("白名单连接池已关闭")
+        """关闭方法保留以兼容现有代码，实际连接池由 db.py 统一管理"""
+        pass
 
 
