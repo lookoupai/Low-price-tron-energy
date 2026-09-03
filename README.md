@@ -17,6 +17,7 @@ telegram频道：https://t.me/lowtron
    - `/query` - 查找低价能量地址（默认 0.01-1 TRX，最多 3 条）
    - `/query 0.01` - 精确查找 0.01 TRX
    - `/query 0.01-0.1` - 查找 0.01-0.1 TRX
+   - `/myid` - 查看自己的 Telegram 用户 ID（用于填写 `ADMIN_USER_IDS`）
 
 2. **频道/群组功能**
    - `/start_push` - 开启定时推送（默认 0.01-1 TRX，仅管理员可用）
@@ -36,7 +37,7 @@ telegram频道：https://t.me/lowtron
    - 自动检测用户发送的TRON地址并提示风险
    - 查询结果中显示黑名单警告信息
    - 仅保留“能量提供方 → 收款地址”的单向关联（默认开启，可用 `/assoc off` 关闭；`/assoc status` 查看状态）
-   - 新增“临时黑名单”概念：1票用户反馈即可生效并标注“（临时）”，方便小流量场景快速沉淀信息（支持24小时内撤回功能预留）
+   - “临时黑名单”：1 票反馈即生效并标注“（临时）”，同向票数达到 2 票后转为正式
 
 4. **白名单功能（新增）**
    - `/whitelist_add <地址> <payment|provider> [原因]` - 将收款地址或能量提供方加入白名单（临时）
@@ -54,6 +55,9 @@ telegram频道：https://t.me/lowtron
      - ▶️ 更多操作（展开：仅收款地址成功/仅提供方成功/仅收款地址有问题/仅提供方有问题/撤回/取消）
    - 按钮说明：成功=两者加白；未成功=两者加黑；更多=展开单独添加/撤回
    - 频道场景采用"轻量投票"：点击即记录并回执（无需与机器人私聊）
+   - 投票按人记录：同一用户重复点击只覆盖不叠加，改点反向按钮即改票
+   - 撤回已可用：投票后 24 小时内可点“撤回”撤销自己的票，撤回后重算名单状态，票数归零则移除条目
+   - 票数阈值：同向 1 票为“临时”，达到 2 票转正式；黑白票同时存在时展示双方票数，不再单向覆盖
 
 6. **文件自动清理功能**
    - 自动清理过期的查询结果文件
@@ -113,6 +117,11 @@ telegram频道：https://t.me/lowtron
    - `DATABASE_URL`：远程 PostgreSQL 连接串（推荐继续用 Supabase）
 
    可选：
+   - `ADMIN_USER_IDS`：管理员用户 ID，逗号分隔，例如 `123456789,987654321`。
+     管理命令（`/start_push`、`/stop_push`、`/blacklist_remove`、`/whitelist_remove`、`/assoc`、`/channels`）
+     在私聊里只对名单内用户开放；**留空则私聊管理命令对所有人关闭**。
+     在群组/频道里仍按 Telegram 自身的管理员身份判断。
+     不知道自己的 ID 就先私聊机器人发 `/myid`。
    - `MIN_TRX_AMOUNT` / `MAX_TRX_AMOUNT`：筛选区间，默认 `0.01` / `1`
    - `TZ`：时区，默认 `Asia/Shanghai`（查询/推送时间和日志都用这个时区，不是 UTC）
    - `BOT_ADVERTISEMENT`：消息底部广告。内容里有 `@` 时必须加引号，例如 `"查询机器人 @lowtronbot"`
@@ -202,6 +211,10 @@ DATABASE_URL=postgresql://tron:tron_energy_pass@127.0.0.1:5432/tron_energy
 
      # Telegram Bot Token
      TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+
+     # 管理员用户 ID（逗号分隔，留空则私聊管理命令对所有人关闭）
+     # 用 /myid 查自己的 ID
+     ADMIN_USER_IDS=
 
      # 时区（默认上海时间）
      TZ=Asia/Shanghai
