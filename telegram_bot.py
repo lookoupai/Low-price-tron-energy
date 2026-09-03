@@ -26,6 +26,16 @@ from blacklist_manager import BlacklistManager
 from whitelist_manager import WhitelistManager
 from settings_manager import SettingsManager
 from push_channel_manager import PushChannelManager
+from feedback_manager import (
+    FeedbackManager,
+    CONFIRM_THRESHOLD,
+    SCOPE_PAIR,
+    SCOPE_PAYMENT,
+    SCOPE_PROVIDER,
+    VOTE_SUCCESS,
+    VOTE_FAIL,
+)
+from energy_offer_cache import EnergyOfferCache
 
 # 配置日志
 logging.basicConfig(
@@ -58,7 +68,7 @@ class TronEnergyBot:
             
         # 初始化TronEnergyFinder
         self.finder = TronEnergyFinder()
-        
+
         # 初始化黑名单管理器
         self.blacklist_manager = BlacklistManager()
         # 初始化白名单管理器
@@ -67,6 +77,13 @@ class TronEnergyBot:
         self.settings_manager = SettingsManager()
         # 频道推送订阅
         self.push_channel_manager = PushChannelManager()
+        # 用户反馈投票
+        self.feedback_manager = FeedbackManager()
+        # 能量报价缓存
+        self.offer_cache = EnergyOfferCache()
+
+        # 管理员白名单（私聊命令鉴权）
+        self.admin_user_ids = self._load_admin_user_ids()
 
         # 添加并发控制
         self._query_lock = asyncio.Lock()
@@ -178,6 +195,29 @@ class TronEnergyBot:
             logger.error(f"判断消息过期失败: {e}")
             return False
 
+    def _load_admin_user_ids(self) -> set:
+        """从环境变量读取管理员用户ID，支持逗号分隔"""
+        raw = os.getenv("ADMIN_USER_IDS", "").strip()
+        if not raw:
+            logger.warning("未设置 ADMIN_USER_IDS，私聊管理命令将对所有人关闭")
+            return set()
+        ids = set()
+        for part in raw.replace(" ", "").split(","):
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except ValueError:
+                logger.warning(f"忽略无效的 ADMIN_USER_IDS 条目: {part}")
+        logger.info(f"已加载 {len(ids)} 个管理员用户ID")
+        return ids
+
+    def _is_admin_user(self, update: Update) -> bool:
+        user = update.effective_user
+        if not user:
+            return False
+        return user.id in self.admin_user_ids
+
     def _build_inline_keyboard(self, addr: Dict) -> InlineKeyboardMarkup:
         """为单条地址信息构建操作按钮"""
         payment = addr.get('address')
@@ -253,6 +293,19 @@ class TronEnergyBot:
         )
         await update.message.reply_text(help_message)
         
+    async def myid_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """返回用户ID，便于配置 ADMIN_USER_IDS"""
+        user = update.effective_user
+        if not user or not update.message:
+            return
+        is_admin = self._is_admin_user(update)
+        await update.message.reply_text(
+            f"您的用户ID：`{user.id}`\n"
+            f"管理员权限：{'✅ 已授权' if is_admin else '❌ 未授权'}\n\n"
+            "如需管理员权限，请把该ID填入 .env 的 ADMIN_USER_IDS 后重启机器人。",
+            parse_mode='Markdown'
+        )
+
     async def check_admin_rights(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
         """检查命令发送者是否为管理员"""
         try:
@@ -260,10 +313,17 @@ class TronEnergyBot:
             if not chat:
                 return False
                 
-            # 私聊情况下不需要检查权限
+            # 私聊只认 ADMIN_USER_IDS 名单，避免任何人都能开推送/改名单
             if chat.type == "private":
-                return True
-                
+                if self._is_admin_user(update):
+                    return True
+                user = update.effective_user
+                logger.info(
+                    f"私聊管理命令被拒绝: user_id={user.id if user else 'unknown'}"
+                    f"（如需授权，请把该ID加入 ADMIN_USER_IDS）"
+                )
+                return False
+
             # 频道消息直接返回True（因为只有管理员才能在频道发消息）
             if chat.type == "channel":
                 return True
@@ -372,11 +432,7 @@ class TronEnergyBot:
             if not self.blacklist_manager._validate_tron_address(address):
                 await update.message.reply_text("❌ 无效的TRON地址格式")
                 return
-                
-            # 初始化黑名单管理器
-            if self.blacklist_manager._connection_pool is None:
-                await self.blacklist_manager.init_database()
-                
+
             # 添加到黑名单
             success = await self.blacklist_manager.add_to_blacklist(
                 address, reason, update.effective_user.id
@@ -697,6 +753,19 @@ class TronEnergyBot:
 
         # 分层状态展示
         message += "📊 状态分析：\n"
+        # 靠谱度（由 24h 同金额代理笔数推导）+ 用户反馈票数
+        status = addr.get('status')
+        if status:
+            proxy_count = addr.get('proxy_count')
+            count_hint = f"（24h 同金额 {proxy_count} 笔）" if proxy_count is not None else ""
+            message += f"🔎 靠谱度：{status}{count_hint}\n"
+        vote_success = addr.get('vote_success', 0)
+        vote_fail = addr.get('vote_fail', 0)
+        if vote_success or vote_fail:
+            message += f"  └ 用户反馈：{vote_success} 人成功 / {vote_fail} 人失败\n"
+        else:
+            message += "  └ 用户反馈：暂无\n"
+
         # 白名单
         wl_notice = addr.get('whitelist_notice') or ""
         if wl_notice:
@@ -774,11 +843,32 @@ class TronEnergyBot:
                     f"🔍 正在查找 {range_text} 低价能量地址，请稍候..."
                 )
 
-                addresses = await self.finder.find_low_cost_energy_addresses(
+                # 优先从缓存查询
+                addresses = await self.offer_cache.query_cached_offers(
                     min_trx=min_trx,
                     max_trx=max_trx,
                     max_results=3,
                 )
+
+                # 缓存命中不足 3 条时，补充扫链查询
+                if len(addresses) < 3:
+                    chain_results = await self.finder.find_low_cost_energy_addresses(
+                        min_trx=min_trx,
+                        max_trx=max_trx,
+                        max_results=3,
+                    )
+                    # 合并结果并去重（按 payment_address）
+                    seen = {addr["address"] for addr in addresses}
+                    for result in chain_results:
+                        if result["address"] not in seen:
+                            addresses.append(result)
+                            seen.add(result["address"])
+                            if len(addresses) >= 3:
+                                break
+
+                    # 将新扫链结果存入缓存
+                    if chain_results:
+                        await self.offer_cache.save_offers(chain_results)
 
                 if not addresses:
                     await wait_message.edit_text(
@@ -882,16 +972,20 @@ class TronEnergyBot:
 
             user_id = update.effective_user.id if update.effective_user else None
             if action == 'vote_success':
-                # 两者加入白名单（临时）+ 组合白名单
+                # 先记票，再按票数决定临时/正式
+                await self.feedback_manager.record_vote(
+                    user_id, payment, provider, SCOPE_PAIR, VOTE_SUCCESS
+                )
                 await self.whitelist_manager.add_address(payment, 'payment', f'用户{user_id}反馈成功', user_id, is_provisional=True)
                 await self.whitelist_manager.add_address(provider, 'provider', f'用户{user_id}反馈成功', user_id, is_provisional=True)
                 await self.whitelist_manager.add_pair(payment, provider, user_id, is_provisional=True)
-                
+                status_text = await self._sync_pair_status(payment, provider)
+
                 # 发送确认消息（不编辑原文）
                 confirmation_text = (
                     "✅ 已记录：您已成功获得能量\n\n"
-                    "• 收款地址与能量提供方已加入白名单（临时）\n"
-                    "• 如需撤回，请联系管理员\n"
+                    f"• 收款地址与能量提供方已加入白名单{status_text}\n"
+                    "• 24 小时内可点「撤回」取消本次反馈\n"
                     "• 感谢您的反馈，已帮助他人判断可信地址"
                 )
                 await context.bot.send_message(
@@ -910,7 +1004,10 @@ class TronEnergyBot:
                 except Exception:
                     pass
             elif action == 'vote_fail':
-                # 两者加入黑名单（临时），并尝试单向关联（提供方→收款地址）
+                # 先记票，再按票数决定临时/正式
+                await self.feedback_manager.record_vote(
+                    user_id, payment, provider, SCOPE_PAIR, VOTE_FAIL
+                )
                 await self.blacklist_manager.add_to_blacklist(payment, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True)
                 await self.blacklist_manager.add_to_blacklist(provider, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True)
                 # 触发一次关联逻辑（内部有开关）
@@ -918,12 +1015,13 @@ class TronEnergyBot:
                     await self.blacklist_manager.auto_associate_addresses(payment, provider)
                 except Exception:
                     pass
-                
+                status_text = await self._sync_pair_status(payment, provider)
+
                 # 发送确认消息（不编辑原文）
                 confirmation_text = (
                     "❌ 已记录：您未成功获得能量\n\n"
-                    "• 收款地址与能量提供方已加入黑名单（临时）\n"
-                    "• 如需撤回，请联系管理员\n"
+                    f"• 收款地址与能量提供方已加入黑名单{status_text}\n"
+                    "• 24 小时内可点「撤回」取消本次反馈\n"
                     "• 感谢您的反馈，已帮助他人规避风险"
                 )
                 await context.bot.send_message(
@@ -953,49 +1051,74 @@ class TronEnergyBot:
                 ]
                 await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
             elif action == 'only_pay_wl':
+                await self.feedback_manager.record_vote(
+                    user_id, payment, provider, SCOPE_PAYMENT, VOTE_SUCCESS
+                )
                 await self.whitelist_manager.add_address(payment, 'payment', '用户反馈：仅收款地址成功', user_id, is_provisional=True)
+                status_text = await self._sync_single_status(payment, 'payment', VOTE_SUCCESS)
                 # 发送确认消息
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text='✅ 已记录：仅收款地址加入白名单（临时）。如需撤回，请联系管理员。',
+                    text=f'✅ 已记录：仅收款地址加入白名单{status_text}。24 小时内可撤回。',
                     reply_to_message_id=query.message.message_id
                 )
                 # 更新按钮
                 try:
-                    recorded_buttons = [[InlineKeyboardButton("✅ 收款地址已加白", callback_data="recorded")]]
+                    recorded_buttons = [[
+                        InlineKeyboardButton("✅ 收款地址已加白", callback_data="recorded"),
+                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
+                    ]]
                     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
                 except Exception:
                     pass
             elif action == 'only_prov_wl':
+                await self.feedback_manager.record_vote(
+                    user_id, payment, provider, SCOPE_PROVIDER, VOTE_SUCCESS
+                )
                 await self.whitelist_manager.add_address(provider, 'provider', '用户反馈：仅提供方成功', user_id, is_provisional=True)
+                status_text = await self._sync_single_status(provider, 'provider', VOTE_SUCCESS)
                 # 发送确认消息
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text='✅ 已记录：仅能量提供方加入白名单（临时）。如需撤回，请联系管理员。',
+                    text=f'✅ 已记录：仅能量提供方加入白名单{status_text}。24 小时内可撤回。',
                     reply_to_message_id=query.message.message_id
                 )
                 # 更新按钮
                 try:
-                    recorded_buttons = [[InlineKeyboardButton("✅ 提供方已加白", callback_data="recorded")]]
+                    recorded_buttons = [[
+                        InlineKeyboardButton("✅ 提供方已加白", callback_data="recorded"),
+                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
+                    ]]
                     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
                 except Exception:
                     pass
             elif action == 'only_pay_bl':
+                await self.feedback_manager.record_vote(
+                    user_id, payment, provider, SCOPE_PAYMENT, VOTE_FAIL
+                )
                 await self.blacklist_manager.add_to_blacklist(payment, '用户反馈：仅收款地址有问题', user_id, 'manual', is_provisional=True)
+                status_text = await self._sync_single_status(payment, 'payment', VOTE_FAIL)
                 # 发送确认消息
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text='❌ 已记录：仅收款地址加入黑名单（临时）。如需撤回，请联系管理员。',
+                    text=f'❌ 已记录：仅收款地址加入黑名单{status_text}。24 小时内可撤回。',
                     reply_to_message_id=query.message.message_id
                 )
                 # 更新按钮
                 try:
-                    recorded_buttons = [[InlineKeyboardButton("❌ 收款地址已加黑", callback_data="recorded")]]
+                    recorded_buttons = [[
+                        InlineKeyboardButton("❌ 收款地址已加黑", callback_data="recorded"),
+                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
+                    ]]
                     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
                 except Exception:
                     pass
             elif action == 'only_prov_bl':
+                await self.feedback_manager.record_vote(
+                    user_id, payment, provider, SCOPE_PROVIDER, VOTE_FAIL
+                )
                 await self.blacklist_manager.add_to_blacklist(provider, '用户反馈：仅提供方有问题', user_id, 'manual', is_provisional=True)
+                status_text = await self._sync_single_status(provider, 'provider', VOTE_FAIL)
                 try:
                     await self.blacklist_manager.auto_associate_addresses(payment, provider)
                 except Exception:
@@ -1003,18 +1126,39 @@ class TronEnergyBot:
                 # 发送确认消息
                 await context.bot.send_message(
                     chat_id=query.message.chat_id,
-                    text='❌ 已记录：仅能量提供方加入黑名单（临时）。如需撤回，请联系管理员。',
+                    text=f'❌ 已记录：仅能量提供方加入黑名单{status_text}。24 小时内可撤回。',
                     reply_to_message_id=query.message.message_id
                 )
                 # 更新按钮
                 try:
-                    recorded_buttons = [[InlineKeyboardButton("❌ 提供方已加黑", callback_data="recorded")]]
+                    recorded_buttons = [[
+                        InlineKeyboardButton("❌ 提供方已加黑", callback_data="recorded"),
+                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
+                    ]]
                     await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
                 except Exception:
                     pass
-            elif action == 'revoke':
-                # 预留：撤回逻辑后续实现（需要记录投票表与时间戳）
-                await query.answer('ℹ️ 撤回功能即将上线，暂请联系管理员处理。', show_alert=True)
+            elif action in ['revoke', 'revoke_success', 'revoke_fail']:
+                revoked = await self._revoke_user_feedback(user_id, payment, provider)
+                if not revoked:
+                    await query.answer(
+                        'ℹ️ 没有可撤回的反馈（仅支持撤回本人 24 小时内的投票）',
+                        show_alert=True
+                    )
+                    return
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text='↩️ 已撤回您的反馈，相关名单记录已按剩余票数重算。',
+                    reply_to_message_id=query.message.message_id
+                )
+                try:
+                    original_markup = self._build_inline_keyboard({
+                        'address': payment,
+                        'energy_provider': provider
+                    })
+                    await query.edit_message_reply_markup(reply_markup=original_markup)
+                except Exception:
+                    pass
             elif action == 'cancel' or action == 'cancel_expired':
                 # 取消操作：恢复原始按钮
                 if payment and provider:
@@ -1034,12 +1178,105 @@ class TronEnergyBot:
                 if action == 'expired_get_new':
                     await query.answer("请使用 /query 命令获取最新地址信息", show_alert=True)
                 else:
-                    await query.answer("该操作已记录，如需撤回请联系管理员")
+                    await query.answer("该操作已记录，可点「撤回」取消本人 24 小时内的反馈")
             else:
                 await query.answer('操作已完成')
         except Exception as e:
             logger.error(f"处理回调失败: {e}")
             
+    async def _sync_single_status(self, address: str, address_type: str, vote_type: str) -> str:
+        """按该地址的同向票数决定名单条目是临时还是正式，返回展示后缀"""
+        try:
+            if address_type == 'payment':
+                counts = await self.feedback_manager.count_votes(payment_address=address)
+            else:
+                counts = await self.feedback_manager.count_votes(provider_address=address)
+            votes = counts.get(vote_type, 0)
+            is_provisional = votes < CONFIRM_THRESHOLD
+            if vote_type == VOTE_SUCCESS:
+                await self.whitelist_manager.set_provisional(address, address_type, is_provisional)
+            else:
+                await self.blacklist_manager.set_provisional(address, is_provisional)
+            return f"（临时，{votes} 票）" if is_provisional else f"（已确认，{votes} 票）"
+        except Exception as e:
+            logger.error(f"同步名单状态失败: {e}")
+            return "（临时）"
+
+    async def _sync_pair_status(self, payment: str, provider: str) -> str:
+        """组合投票后同步双方及组合状态"""
+        try:
+            counts = await self.feedback_manager.count_votes(
+                payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
+            )
+            success_votes = counts.get(VOTE_SUCCESS, 0)
+            fail_votes = counts.get(VOTE_FAIL, 0)
+            if success_votes >= fail_votes:
+                vote_type, votes = VOTE_SUCCESS, success_votes
+            else:
+                vote_type, votes = VOTE_FAIL, fail_votes
+            is_provisional = votes < CONFIRM_THRESHOLD
+
+            if vote_type == VOTE_SUCCESS:
+                await self.whitelist_manager.set_provisional(payment, 'payment', is_provisional)
+                await self.whitelist_manager.set_provisional(provider, 'provider', is_provisional)
+                await self.whitelist_manager.set_pair_provisional(payment, provider, is_provisional)
+            else:
+                await self.blacklist_manager.set_provisional(payment, is_provisional)
+                await self.blacklist_manager.set_provisional(provider, is_provisional)
+
+            suffix = f"（临时，{votes} 票）" if is_provisional else f"（已确认，{votes} 票）"
+            if success_votes and fail_votes:
+                suffix += f"\n• 该组合当前反馈：成功 {success_votes} 票 / 未成功 {fail_votes} 票"
+            return suffix
+        except Exception as e:
+            logger.error(f"同步组合状态失败: {e}")
+            return "（临时）"
+
+    async def _revoke_user_feedback(self, user_id: Optional[int], payment: str, provider: str) -> bool:
+        """撤回用户在时间窗内的投票，并按剩余票数重算名单条目"""
+        if not user_id:
+            return False
+        try:
+            revoked = await self.feedback_manager.revoke_votes(user_id, payment, provider)
+            if not revoked:
+                return False
+
+            for address, address_type in ((payment, 'payment'), (provider, 'provider')):
+                if address_type == 'payment':
+                    counts = await self.feedback_manager.count_votes(payment_address=address)
+                else:
+                    counts = await self.feedback_manager.count_votes(provider_address=address)
+
+                if counts.get(VOTE_SUCCESS, 0) == 0:
+                    await self.whitelist_manager.remove_address(address, address_type)
+                else:
+                    await self.whitelist_manager.set_provisional(
+                        address, address_type,
+                        counts[VOTE_SUCCESS] < CONFIRM_THRESHOLD
+                    )
+
+                if counts.get(VOTE_FAIL, 0) == 0:
+                    await self.blacklist_manager.remove_from_blacklist(address)
+                else:
+                    await self.blacklist_manager.set_provisional(
+                        address, counts[VOTE_FAIL] < CONFIRM_THRESHOLD
+                    )
+
+            pair_counts = await self.feedback_manager.count_votes(
+                payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
+            )
+            if pair_counts.get(VOTE_SUCCESS, 0) == 0:
+                await self.whitelist_manager.remove_pair(payment, provider)
+            else:
+                await self.whitelist_manager.set_pair_provisional(
+                    payment, provider,
+                    pair_counts[VOTE_SUCCESS] < CONFIRM_THRESHOLD
+                )
+            return True
+        except Exception as e:
+            logger.error(f"撤回反馈失败: {e}")
+            return False
+
     async def _disable_invalid_channel(self, chat_id: int, error: Exception) -> None:
         error_text = str(error)
         if "Forbidden" not in error_text and "Bad Request" not in error_text:
@@ -1153,28 +1390,51 @@ class TronEnergyBot:
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理错误"""
         logger.error(f"更新 {update} 导致错误 {context.error}", exc_info=context.error)
-        
+
+    async def cleanup_expired_cache(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """定时清理过期缓存"""
+        try:
+            deleted = await self.offer_cache.cleanup_expired()
+            if deleted > 0:
+                logger.info(f"已清理 {deleted} 条过期缓存记录")
+        except Exception as e:
+            logger.error(f"清理过期缓存时出错: {e}")
+
     def run(self):
         """运行机器人"""
         try:
             # 创建应用
             self.application = Application.builder().token(self.token).build()
-            
+
+            # 在启动时初始化所有管理器的数据库表
+            async def post_init(app):
+                """应用启动后的初始化"""
+                await self.blacklist_manager.init_database()
+                await self.whitelist_manager.init_database()
+                await self.settings_manager.init_database()
+                await self.push_channel_manager.init_database()
+                await self.feedback_manager.init_database()
+                await self.offer_cache.init_database()
+                logger.info("所有数据库表初始化完成")
+
+            self.application.post_init = post_init
+
             # 添加命令处理器，允许在频道中使用命令
             self.application.add_handler(CommandHandler("start", self.start_command, filters.ChatType.PRIVATE))
             self.application.add_handler(CommandHandler("help", self.help_command, filters.ChatType.PRIVATE))
+            self.application.add_handler(CommandHandler("myid", self.myid_command, filters.ChatType.PRIVATE))
             self.application.add_handler(CommandHandler("query", self.query_command))
             self.application.add_handler(CommandHandler(
-                "start_push", 
+                "start_push",
                 self.start_push_command,
                 filters.ChatType.CHANNEL | filters.ChatType.GROUPS | filters.ChatType.PRIVATE
             ))
             self.application.add_handler(CommandHandler(
-                "stop_push", 
+                "stop_push",
                 self.stop_push_command,
                 filters.ChatType.CHANNEL | filters.ChatType.GROUPS | filters.ChatType.PRIVATE
             ))
-            
+
             # 添加黑名单相关命令处理器
             self.application.add_handler(CommandHandler("blacklist_add", self.blacklist_add_command))
             self.application.add_handler(CommandHandler("blacklist_check", self.blacklist_check_command))
@@ -1189,7 +1449,7 @@ class TronEnergyBot:
 
             # 黑名单关联开关
             self.application.add_handler(CommandHandler("assoc", self.assoc_command))
-            
+
             # 查看活跃频道列表
             self.application.add_handler(CommandHandler("channels", self.channels_command))
 
@@ -1210,7 +1470,7 @@ class TronEnergyBot:
             
             # 添加错误处理器
             self.application.add_error_handler(self.error_handler)
-            
+
             # 设置定时任务（改为启动后5分钟开始第一次检查）
             job_queue = self.application.job_queue
             job_queue.run_repeating(
@@ -1218,7 +1478,14 @@ class TronEnergyBot:
                 interval=3600,  # 每小时运行一次
                 first=300  # 启动5分钟后运行第一次
             )
-            
+
+            # 定时清理过期缓存（每 6 小时清理一次）
+            job_queue.run_repeating(
+                self.cleanup_expired_cache,
+                interval=21600,  # 6 小时
+                first=600  # 启动 10 分钟后首次清理
+            )
+
             logger.info("机器人启动成功，等待命令...")
             
             # 启动机器人，允许处理频道消息
