@@ -491,27 +491,31 @@ class TronEnergyFinder:
             await asyncio.sleep(self._min_api_interval)
         self._last_api_call = current_time
         
-    async def _make_request(self, url: str, params: Dict = None) -> Optional[Dict]:
-        """发送 API 请求"""
+    async def _make_request(self, url: str, params: Dict = None, timeout: int = 30) -> Optional[Dict]:
+        """发送 API 请求，带超时控制"""
         try:
             # 获取下一个可用的 API Key
             api_key = await self.api_manager.get_next_key()
-            
+
             headers = {
                 "TRON-PRO-API-KEY": api_key,
                 "Accept": "application/json"
             }
-            
+
             connector = aiohttp.TCPConnector(ssl=self._ssl_context)
-            
-            async with aiohttp.ClientSession(connector=connector) as session:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj) as session:
                 async with session.get(url, params=params, headers=headers) as response:
                     if response.status == 200:
                         return await response.json()
                     else:
                         logger.error(f"API请求失败: {response.status} - {await response.text()}")
                         return None
-                        
+
+        except asyncio.TimeoutError:
+            logger.warning(f"API请求超时 ({timeout}s): {url}")
+            return None
         except Exception as e:
             logger.error(f"请求失败: {e}")
             return None

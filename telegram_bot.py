@@ -1334,45 +1334,53 @@ class TronEnergyBot:
             await self.push_channel_manager.mark_pushed(chat_id, sent_addresses)
 
     async def broadcast_addresses(self, context: ContextTypes.DEFAULT_TYPE, specific_chat_id: Optional[int] = None) -> None:
-        """向活跃的频道广播地址信息"""
+        """向活跃的频道广播地址信息，带整体超时控制"""
         try:
             logger.info(f"开始广播地址信息 specific_chat_id={specific_chat_id}")
             notify_empty = specific_chat_id is not None
 
-            if specific_chat_id is not None:
-                channel = await self.push_channel_manager.get_channel(specific_chat_id)
-                if not channel or not channel["enabled"]:
-                    logger.info(f"频道 {specific_chat_id} 未启用推送，跳过广播")
-                    return
-                targets = [channel]
-            else:
-                targets = await self.push_channel_manager.get_enabled_channels()
-                if not targets:
-                    logger.info("没有活跃的频道，跳过广播")
-                    return
+            # 为整个广播任务设置 5 分钟超时
+            async def _do_broadcast():
+                if specific_chat_id is not None:
+                    channel = await self.push_channel_manager.get_channel(specific_chat_id)
+                    if not channel or not channel["enabled"]:
+                        logger.info(f"频道 {specific_chat_id} 未启用推送，跳过广播")
+                        return
+                    targets = [channel]
+                else:
+                    targets = await self.push_channel_manager.get_enabled_channels()
+                    if not targets:
+                        logger.info("没有活跃的频道，跳过广播")
+                        return
 
-            grouped: Dict[tuple, List[Dict]] = defaultdict(list)
-            for channel in targets:
-                key = (round(channel["min_trx"], 4), round(channel["max_trx"], 4))
-                grouped[key].append(channel)
+                grouped: Dict[tuple, List[Dict]] = defaultdict(list)
+                for channel in targets:
+                    key = (round(channel["min_trx"], 4), round(channel["max_trx"], 4))
+                    grouped[key].append(channel)
 
-            async with self._query_semaphore:
-                for (min_trx, max_trx), channels in grouped.items():
-                    addresses = await self.finder.find_low_cost_energy_addresses(
-                        min_trx=min_trx,
-                        max_trx=max_trx,
-                        max_results=3,
-                    )
-                    for channel in channels:
-                        await self._send_push_results(
-                            context,
-                            channel["chat_id"],
-                            addresses,
-                            min_trx,
-                            max_trx,
-                            notify_empty=notify_empty,
+                async with self._query_semaphore:
+                    for (min_trx, max_trx), channels in grouped.items():
+                        addresses = await self.finder.find_low_cost_energy_addresses(
+                            min_trx=min_trx,
+                            max_trx=max_trx,
+                            max_results=3,
                         )
+                        for channel in channels:
+                            await self._send_push_results(
+                                context,
+                                channel["chat_id"],
+                                addresses,
+                                min_trx,
+                                max_trx,
+                                notify_empty=notify_empty,
+                            )
 
+            # 设置 5 分钟超时
+            await asyncio.wait_for(_do_broadcast(), timeout=300)
+            logger.info("广播地址任务完成")
+
+        except asyncio.TimeoutError:
+            logger.error(f"广播地址任务超时（5分钟），已强制结束")
         except Exception as e:
             logger.error(f"广播地址时出错: {e}")
 
@@ -1476,7 +1484,8 @@ class TronEnergyBot:
             job_queue.run_repeating(
                 self.broadcast_addresses,
                 interval=3600,  # 每小时运行一次
-                first=300  # 启动5分钟后运行第一次
+                first=300,  # 启动5分钟后运行第一次
+                name="broadcast_addresses"
             )
 
             # 定时清理过期缓存（每 6 小时清理一次）
