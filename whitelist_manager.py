@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 class WhitelistManager:
-    “””白名单管理器
+    """白名单管理器
 
     管理收款地址、能量提供方以及两者组合的白名单记录。
-    支持”临时”标记，用于1票即时生效的场景。
-    “””
+    支持"临时"标记，用于1票即时生效的场景。
+    """
 
     def __init__(self) -> None:
         self._cache = TTLCache(maxsize=2000, ttl=300)
