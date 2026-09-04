@@ -135,6 +135,37 @@ class FeedbackManager:
             counts[row["vote_type"]] = int(row["cnt"])
         return counts
 
+    async def count_address_votes(self, address: str, address_type: str) -> Dict[str, int]:
+        """按地址角色统计有效票数，返回 {'success': n, 'fail': m}
+
+        收款地址只统计组合票与"仅收款地址"票，能量提供方只统计组合票与
+        "仅提供方"票。否则「仅提供方有问题」这类单边票会被算到另一个地址头上。
+        """
+        pool = await self._ensure_pool()
+        if address_type == 'payment':
+            column, scopes = "payment_address", [SCOPE_PAIR, SCOPE_PAYMENT]
+        else:
+            column, scopes = "provider_address", [SCOPE_PAIR, SCOPE_PROVIDER]
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT vote_type, COUNT(*) AS cnt
+                FROM address_feedback
+                WHERE revoked_at IS NULL
+                  AND {column} = $1
+                  AND scope = ANY($2::varchar[])
+                GROUP BY vote_type
+                """,
+                address,
+                scopes,
+            )
+
+        counts = {VOTE_SUCCESS: 0, VOTE_FAIL: 0}
+        for row in rows:
+            counts[row["vote_type"]] = int(row["cnt"])
+        return counts
+
     async def get_user_votes(
         self,
         user_id: int,

@@ -50,6 +50,12 @@ class BlacklistManager:
                 ALTER TABLE blacklist
                 ADD COLUMN IF NOT EXISTS is_provisional BOOLEAN DEFAULT false
             ''')
+            # 标记该行是否只由用户投票产生：只有这类行才随票数增删，
+            # 管理员手工添加与自动关联产生的行不应被别人的一票冲掉
+            await connection.execute('''
+                ALTER TABLE blacklist
+                ADD COLUMN IF NOT EXISTS from_feedback BOOLEAN DEFAULT false
+            ''')
             
             # 创建关联记录表
             await connection.execute('''
@@ -69,9 +75,10 @@ class BlacklistManager:
                 CREATE INDEX IF NOT EXISTS idx_blacklist_active ON blacklist(is_active);
             ''')
             
-    async def add_to_blacklist(self, address: str, reason: str = None, 
+    async def add_to_blacklist(self, address: str, reason: str = None,
                              added_by: int = None, addr_type: str = 'manual',
-                             is_provisional: bool = False) -> bool:
+                             is_provisional: bool = False,
+                             from_feedback: bool = False) -> bool:
         """添加地址到黑名单"""
         try:
             if not self._validate_tron_address(address):
@@ -80,15 +87,16 @@ class BlacklistManager:
             pool = await get_db_pool()
             async with pool.acquire() as connection:
                 await connection.execute('''
-                    INSERT INTO blacklist (address, reason, type, added_by, is_provisional)
-                    VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (address) 
-                    DO UPDATE SET 
+                    INSERT INTO blacklist (address, reason, type, added_by, is_provisional, from_feedback)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (address)
+                    DO UPDATE SET
                         reason = COALESCE(EXCLUDED.reason, blacklist.reason),
                         is_active = true,
                         added_at = NOW(),
-                        is_provisional = EXCLUDED.is_provisional
-                ''', address, reason, addr_type, added_by, is_provisional)
+                        is_provisional = EXCLUDED.is_provisional,
+                        from_feedback = blacklist.from_feedback AND EXCLUDED.from_feedback
+                ''', address, reason, addr_type, added_by, is_provisional, from_feedback)
                 
             # 清除缓存
             self._blacklist_cache.pop(address, None)
@@ -139,16 +147,19 @@ class BlacklistManager:
             logger.error(f"检查黑名单失败: {e}")
             return None
             
-    async def remove_from_blacklist(self, address: str) -> bool:
-        """从黑名单中移除地址"""
+    async def remove_from_blacklist(self, address: str, only_feedback: bool = False) -> bool:
+        """从黑名单中移除地址
+
+        only_feedback=True 时只停用纯粹由投票产生的行，用于票数归零后的重算，
+        避免管理员手工添加或自动关联产生的条目被投票撤销。
+        """
         try:
             pool = await get_db_pool()
+            query = 'UPDATE blacklist SET is_active = false WHERE address = $1'
+            if only_feedback:
+                query += ' AND from_feedback = true'
             async with pool.acquire() as connection:
-                result = await connection.execute('''
-                    UPDATE blacklist 
-                    SET is_active = false 
-                    WHERE address = $1
-                ''', address)
+                await connection.execute(query, address)
                 
             # 清除缓存
             self._blacklist_cache.pop(address, None)

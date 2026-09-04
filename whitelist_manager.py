@@ -41,6 +41,15 @@ class WhitelistManager:
                 )
                 """
             )
+            # 标记该行是否只由用户投票产生：只有这类行才随票数增删，
+            # 管理员手工添加的行不应被别人的一票冲掉
+            await conn.execute(
+                "ALTER TABLE whitelist ADD COLUMN IF NOT EXISTS from_feedback BOOLEAN DEFAULT false"
+            )
+            # 兼容早于"临时/正式"机制建立的旧表
+            await conn.execute(
+                "ALTER TABLE whitelist ADD COLUMN IF NOT EXISTS is_provisional BOOLEAN DEFAULT false"
+            )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_whitelist_address ON whitelist(address)"
             )
@@ -66,13 +75,16 @@ class WhitelistManager:
                 """
             )
             await conn.execute(
+                "ALTER TABLE whitelist_pairs ADD COLUMN IF NOT EXISTS is_provisional BOOLEAN DEFAULT false"
+            )
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_whitelist_pairs_payment ON whitelist_pairs(payment_address)"
             )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_whitelist_pairs_provider ON whitelist_pairs(provider_address)"
             )
 
-    async def add_address(self, address: str, address_type: str, reason: Optional[str], added_by: Optional[int], is_provisional: bool = True) -> bool:
+    async def add_address(self, address: str, address_type: str, reason: Optional[str], added_by: Optional[int], is_provisional: bool = True, from_feedback: bool = False) -> bool:
         if not self._validate_tron_address(address):
             return False
         if address_type not in ("payment", "provider"):
@@ -81,13 +93,14 @@ class WhitelistManager:
         async with pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO whitelist (address, address_type, reason, added_by, is_provisional)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO whitelist (address, address_type, reason, added_by, is_provisional, from_feedback)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (address, address_type)
                 DO UPDATE SET
                     reason = COALESCE(EXCLUDED.reason, whitelist.reason),
                     is_active = true,
                     is_provisional = EXCLUDED.is_provisional,
+                    from_feedback = whitelist.from_feedback AND EXCLUDED.from_feedback,
                     success_count = whitelist.success_count + 1,
                     added_at = NOW()
                 """,
@@ -96,19 +109,24 @@ class WhitelistManager:
                 reason,
                 added_by,
                 is_provisional,
+                from_feedback,
             )
         # invalidate cache
         self._cache.pop((address, address_type), None)
         return True
 
-    async def remove_address(self, address: str, address_type: str) -> bool:
+    async def remove_address(self, address: str, address_type: str, only_feedback: bool = False) -> bool:
+        """停用白名单条目
+
+        only_feedback=True 时只停用纯粹由投票产生的行，用于票数归零后的重算，
+        避免管理员手工添加的条目被投票撤销。
+        """
         pool = await get_db_pool()
+        query = "UPDATE whitelist SET is_active = false WHERE address = $1 AND address_type = $2"
+        if only_feedback:
+            query += " AND from_feedback = true"
         async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE whitelist SET is_active = false WHERE address = $1 AND address_type = $2",
-                address,
-                address_type,
-            )
+            await conn.execute(query, address, address_type)
         self._cache.pop((address, address_type), None)
         return True
 
