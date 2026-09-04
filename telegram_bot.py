@@ -35,7 +35,7 @@ from feedback_manager import (
     VOTE_SUCCESS,
     VOTE_FAIL,
 )
-from energy_offer_cache import EnergyOfferCache
+from delivery_stats_store import DeliveryStatsStore
 
 # 配置日志
 logging.basicConfig(
@@ -79,8 +79,8 @@ class TronEnergyBot:
         self.push_channel_manager = PushChannelManager()
         # 用户反馈投票
         self.feedback_manager = FeedbackManager()
-        # 能量报价缓存
-        self.offer_cache = EnergyOfferCache()
+        # 付款到账率观测
+        self.delivery_store = DeliveryStatsStore()
 
         # 管理员白名单（私聊命令鉴权）
         self.admin_user_ids = self._load_admin_user_ids()
@@ -739,14 +739,18 @@ class TronEnergyBot:
         energy_display = addr['energy_quantity']
         if addr['energy_source'] == "计算值":
             energy_display = f"{energy_display} (计算值，仅供参考)"
-            
+
+        # TronScan 单页只给 50 条，直接显示"24h 交易数"会把日均 50 笔和上万笔的
+        # 地址显示成同一个数字，所以改成基于时间跨度的频率描述
+        frequency_display = addr.get('tx_frequency') or f"{addr.get('recent_tx_count', 0)} 笔"
+
         message = (
             f"🔹 【收款地址】: `{addr['address']}`\n"
             f"🔹 【能量提供方】: `{addr['energy_provider']}`\n"
             f"🔹 【购买记录】: [查看](https://tronscan.org/#/address/{addr['address']})\n"
             f"🔹 【收款金额】: {addr['purchase_amount']} TRX\n"
             f"🔹 【能量数量】: {energy_display}\n"
-            f"🔹 【24h交易数】: {addr['recent_tx_count']} 笔\n"
+            f"🔹 【收款频率】: {frequency_display}\n"
             f"🔹 【转账哈希】: `{addr['tx_hash']}`\n"
             f"🔹 【代理哈希】: `{addr['proxy_tx_hash']}`\n\n"
         )
@@ -759,6 +763,10 @@ class TronEnergyBot:
             proxy_count = addr.get('proxy_count')
             count_hint = f"（24h 同金额 {proxy_count} 笔）" if proxy_count is not None else ""
             message += f"🔎 靠谱度：{status}{count_hint}\n"
+        # 到账率：付款后 10 秒内收到能量代理才算真到账
+        delivery_note = addr.get('delivery_note')
+        if delivery_note:
+            message += f"  └ 到账情况：{delivery_note}\n"
         vote_success = addr.get('vote_success', 0)
         vote_fail = addr.get('vote_fail', 0)
         if vote_success or vote_fail:
@@ -843,32 +851,11 @@ class TronEnergyBot:
                     f"🔍 正在查找 {range_text} 低价能量地址，请稍候..."
                 )
 
-                # 优先从缓存查询
-                addresses = await self.offer_cache.query_cached_offers(
+                addresses = await self.finder.find_low_cost_energy_addresses(
                     min_trx=min_trx,
                     max_trx=max_trx,
                     max_results=3,
                 )
-
-                # 缓存命中不足 3 条时，补充扫链查询
-                if len(addresses) < 3:
-                    chain_results = await self.finder.find_low_cost_energy_addresses(
-                        min_trx=min_trx,
-                        max_trx=max_trx,
-                        max_results=3,
-                    )
-                    # 合并结果并去重（按 payment_address）
-                    seen = {addr["address"] for addr in addresses}
-                    for result in chain_results:
-                        if result["address"] not in seen:
-                            addresses.append(result)
-                            seen.add(result["address"])
-                            if len(addresses) >= 3:
-                                break
-
-                    # 将新扫链结果存入缓存
-                    if chain_results:
-                        await self.offer_cache.save_offers(chain_results)
 
                 if not addresses:
                     await wait_message.edit_text(
@@ -1402,11 +1389,11 @@ class TronEnergyBot:
     async def cleanup_expired_cache(self, context: ContextTypes.DEFAULT_TYPE) -> None:
         """定时清理过期缓存"""
         try:
-            deleted = await self.offer_cache.cleanup_expired()
+            deleted = await self.delivery_store.cleanup_expired()
             if deleted > 0:
-                logger.info(f"已清理 {deleted} 条过期缓存记录")
+                logger.info(f"已清理 {deleted} 条过期到账观测记录")
         except Exception as e:
-            logger.error(f"清理过期缓存时出错: {e}")
+            logger.error(f"清理过期到账观测时出错: {e}")
 
     def run(self):
         """运行机器人"""
@@ -1422,7 +1409,7 @@ class TronEnergyBot:
                 await self.settings_manager.init_database()
                 await self.push_channel_manager.init_database()
                 await self.feedback_manager.init_database()
-                await self.offer_cache.init_database()
+                await self.delivery_store.init_database()
                 logger.info("所有数据库表初始化完成")
 
             self.application.post_init = post_init
