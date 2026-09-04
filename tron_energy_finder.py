@@ -55,6 +55,12 @@ MAX_DAILY_REQUESTS = 100000
 PAIRING_WINDOW_BLOCKS = 6
 # 付款后多久收到能量代理才算真到账；超时到账多为买家换供应方重试，无因果关系
 MAX_DELIVERY_DELAY_MS = 10_000
+# 判定靠谱度所需的最少到账观测样本，低于此数只报"样本不足"
+MIN_DELIVERY_SAMPLE = 5
+# 到账率达到该比例算"可靠"
+DELIVERY_RELIABLE_RATE = 0.9
+# 到账率达到该比例算"一般"，低于则"存疑"
+DELIVERY_FAIR_RATE = 0.7
 # TronScan /transaction 单页返回上限，传更大值也只返回 50
 TRONSCAN_PAGE_LIMIT = 50
 # 429 响应体里服务端给出的封禁时长，例如 "the query server is suspended for 16 s"
@@ -326,28 +332,26 @@ class TronEnergyFinder:
             logger.warning(f"读取到账率观测失败: {e}")
             return {}
 
-    async def get_reliability(self, max_count: int, payment_address: str) -> Dict:
+    async def get_reliability(self, payment_address: str, delivered: int = 0,
+                             total: int = 0) -> Dict:
         """推导地址靠谱度，并附带该收款地址的有效票数
 
-        max_count 为同一金额在 24h 内的代理笔数。入口筛选已要求 >=5，
-        故只区分：>=7 正常使用 / 5-6 笔数偏少（可能有白名单限制）。
+        靠谱度只由到账率决定（见 _delivery_status），不再使用被单页截断的同金额笔数。
         """
-        if max_count >= 7:
-            status = "正常使用"
-        else:
-            status = "笔数偏少，可能有白名单限制"
+        status = self._delivery_status(delivered, total)
 
         votes = {"success": 0, "fail": 0}
         await self.init_feedback_manager()
         if self._feedback_manager is not None:
             try:
-                votes = await self._feedback_manager.count_votes(payment_address=payment_address)
+                votes = await self._feedback_manager.count_address_votes(
+                    payment_address, "payment"
+                )
             except Exception as e:
                 logger.warning(f"读取反馈票数失败: {e}")
 
         return {
             "status": status,
-            "proxy_count": max_count,
             "vote_success": votes.get("success", 0),
             "vote_fail": votes.get("fail", 0),
         }
@@ -822,12 +826,15 @@ class TronEnergyFinder:
                 blacklist_result = await self.check_and_handle_blacklist(
                     payment_address, energy_provider
                 )
-                reliability = await self.get_reliability(max_count, payment_address)
 
                 delivery = delivery or {}
                 delivered = int(delivery.get("delivered", 0))
                 delivery_total = int(delivery.get("total", 0))
                 span_ms = max(timestamps) - min(timestamps)
+
+                reliability = await self.get_reliability(
+                    payment_address, delivered, delivery_total
+                )
 
                 result = {
                     "address": payment_address,
@@ -843,10 +850,8 @@ class TronEnergyFinder:
                     "tx_span_ms": span_ms,
                     "delivery_total": delivery_total,
                     "delivery_delivered": delivered,
-                    "delivery_note": self._format_delivery_note(delivered, delivery_total),
                     "delivery_delay_ms": best_pair["delay_ms"],
                     "status": reliability["status"],
-                    "proxy_count": reliability["proxy_count"],
                     "vote_success": reliability["vote_success"],
                     "vote_fail": reliability["vote_fail"],
                 }
@@ -926,7 +931,6 @@ class TronEnergyFinder:
                 energy_display = f"{energy_display} (计算值，仅供参考)"
 
             frequency_display = addr.get('tx_frequency') or f"{addr.get('recent_tx_count', 0)} 笔"
-            delivery_display = addr.get('delivery_note') or "样本不足，暂无统计"
 
             result_text += f"""🔹 【收款地址】: {addr['address']}
 🔹 【能量提供方】: {addr['energy_provider']}
@@ -934,11 +938,10 @@ class TronEnergyFinder:
 🔹 【收款金额】: {addr['purchase_amount']} TRX
 🔹 【能量数量】: {energy_display}
 🔹 【收款频率】: {frequency_display}
-🔹 【到账情况】: {delivery_display}
 🔹 【转账哈希】: {addr['tx_hash']}
 🔹 【代理哈希】: {addr['proxy_tx_hash']}
 
-【地址信息】{addr['status']}
+【靠谱度】{addr['status']}
 """
         logger.info(result_text)
 
@@ -1218,13 +1221,28 @@ class TronEnergyFinder:
         return f"最近 {tx_count} 笔跨 {span_text}，{rate_text}"
 
     @staticmethod
-    def _format_delivery_note(delivered: int, total: int, max_delay_ms: int = MAX_DELIVERY_DELAY_MS) -> str:
-        """把到账率统计转成展示文本"""
-        if total <= 0:
-            return "样本不足，暂无统计"
+    def _delivery_status(delivered: int, total: int, max_delay_ms: int = MAX_DELIVERY_DELAY_MS) -> str:
+        """用到账率推导靠谱度展示文本
 
+        旧实现按"同金额笔数"分档，但那个计数来自 TronScan 单页 50 条的截断结果，
+        入口筛选又已要求 >=5，实际几乎恒为"正常使用"，等于没有信息量。
+        改用付款后 10 秒内是否收到能量代理这个可验证的因果结果。
+        """
         seconds = int(max_delay_ms / 1000)
-        return f"{delivered}/{total} 笔在 {seconds} 秒内到账（{delivered / total:.0%}）"
+        if total <= 0:
+            return f"样本不足（暂无 {seconds} 秒内到账观测）"
+        if total < MIN_DELIVERY_SAMPLE:
+            return f"样本不足（已观测 {total} 笔，需 {MIN_DELIVERY_SAMPLE} 笔）"
+
+        rate = delivered / total
+        if rate >= DELIVERY_RELIABLE_RATE:
+            tier = "可靠"
+        elif rate >= DELIVERY_FAIR_RATE:
+            tier = "一般"
+        else:
+            tier = "存疑"
+
+        return f"{tier}（{seconds} 秒内到账 {delivered}/{total}，{rate:.0%}）"
 
     async def find_low_cost_energy_addresses(
         self,

@@ -9,10 +9,14 @@
 """
 import pytest
 
-from tron_energy_finder import TronEnergyFinder
+from tron_energy_finder import (
+    MIN_DELIVERY_SAMPLE,
+    TronEnergyFinder,
+)
 
 stats = TronEnergyFinder._delivery_stats
 frequency = TronEnergyFinder._format_tx_frequency
+reliability = TronEnergyFinder._delivery_status
 
 BLOCK_MS = 3000
 BASE_TS = 1_700_000_000_000
@@ -144,3 +148,51 @@ class TestFrequencyFormat:
     def test_single_transaction_reports_insufficient_data(self):
         """只有 1 笔无法估算频率"""
         assert "跨度不足" in frequency(1, 60_000)
+
+
+class TestReliabilityStatus:
+    """靠谱度分档测试
+
+    旧实现按「同金额笔数」分档，但该计数被 TronScan 单页 50 条截断，
+    且入口筛选已要求 >=5，实际恒为"正常使用"。现改由到账率驱动。
+    """
+
+    def test_full_delivery_is_reliable(self):
+        """样本足够且全部到账应为可靠"""
+        text = reliability(5, 5)
+        assert text.startswith("可靠")
+        assert "5/5" in text and "100%" in text
+
+    def test_partial_delivery_is_fair(self):
+        """到账率 70%-90% 应为一般"""
+        text = reliability(8, 10)
+        assert text.startswith("一般")
+        assert "8/10" in text
+
+    def test_low_delivery_is_doubtful(self):
+        """到账率低于 70% 应为存疑"""
+        assert reliability(5, 10).startswith("存疑")
+
+    def test_boundary_ninety_percent_is_reliable(self):
+        """恰好 90% 属于可靠"""
+        assert reliability(9, 10).startswith("可靠")
+
+    def test_boundary_seventy_percent_is_fair(self):
+        """恰好 70% 属于一般"""
+        assert reliability(7, 10).startswith("一般")
+
+    def test_small_sample_reports_insufficient(self):
+        """样本不足门槛时不给结论，避免 1/1=100% 被当成可靠"""
+        text = reliability(1, 1)
+        assert text.startswith("样本不足")
+        assert "已观测 1 笔" in text
+        assert f"需 {MIN_DELIVERY_SAMPLE} 笔" in text
+
+    def test_no_sample_reports_insufficient(self):
+        """完全没有观测时也只报样本不足"""
+        assert reliability(0, 0).startswith("样本不足")
+
+    def test_status_mentions_delay_window(self):
+        """结论里要带上 10 秒这个判定口径"""
+        assert "10 秒" in reliability(5, 5)
+        assert "10 秒" in reliability(0, 0)

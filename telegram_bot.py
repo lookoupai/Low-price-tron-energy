@@ -757,16 +757,10 @@ class TronEnergyBot:
 
         # 分层状态展示
         message += "📊 状态分析：\n"
-        # 靠谱度（由 24h 同金额代理笔数推导）+ 用户反馈票数
+        # 靠谱度由付款后 10 秒内的实际到账率推导；同金额笔数受单页 50 条截断，不再展示
         status = addr.get('status')
         if status:
-            proxy_count = addr.get('proxy_count')
-            count_hint = f"（24h 同金额 {proxy_count} 笔）" if proxy_count is not None else ""
-            message += f"🔎 靠谱度：{status}{count_hint}\n"
-        # 到账率：付款后 10 秒内收到能量代理才算真到账
-        delivery_note = addr.get('delivery_note')
-        if delivery_note:
-            message += f"  └ 到账情况：{delivery_note}\n"
+            message += f"🔎 靠谱度：{status}\n"
         vote_success = addr.get('vote_success', 0)
         vote_fail = addr.get('vote_fail', 0)
         if vote_success or vote_fail:
@@ -963,10 +957,10 @@ class TronEnergyBot:
                 await self.feedback_manager.record_vote(
                     user_id, payment, provider, SCOPE_PAIR, VOTE_SUCCESS
                 )
-                await self.whitelist_manager.add_address(payment, 'payment', f'用户{user_id}反馈成功', user_id, is_provisional=True)
-                await self.whitelist_manager.add_address(provider, 'provider', f'用户{user_id}反馈成功', user_id, is_provisional=True)
+                await self.whitelist_manager.add_address(payment, 'payment', f'用户{user_id}反馈成功', user_id, is_provisional=True, from_feedback=True)
+                await self.whitelist_manager.add_address(provider, 'provider', f'用户{user_id}反馈成功', user_id, is_provisional=True, from_feedback=True)
                 await self.whitelist_manager.add_pair(payment, provider, user_id, is_provisional=True)
-                status_text = await self._sync_pair_status(payment, provider)
+                status_text = await self._sync_pair_status(payment, provider, VOTE_SUCCESS)
 
                 # 发送确认消息（不编辑原文）
                 confirmation_text = (
@@ -995,14 +989,14 @@ class TronEnergyBot:
                 await self.feedback_manager.record_vote(
                     user_id, payment, provider, SCOPE_PAIR, VOTE_FAIL
                 )
-                await self.blacklist_manager.add_to_blacklist(payment, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True)
-                await self.blacklist_manager.add_to_blacklist(provider, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True)
+                await self.blacklist_manager.add_to_blacklist(payment, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True, from_feedback=True)
+                await self.blacklist_manager.add_to_blacklist(provider, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True, from_feedback=True)
                 # 触发一次关联逻辑（内部有开关）
                 try:
                     await self.blacklist_manager.auto_associate_addresses(payment, provider)
                 except Exception:
                     pass
-                status_text = await self._sync_pair_status(payment, provider)
+                status_text = await self._sync_pair_status(payment, provider, VOTE_FAIL)
 
                 # 发送确认消息（不编辑原文）
                 confirmation_text = (
@@ -1041,7 +1035,7 @@ class TronEnergyBot:
                 await self.feedback_manager.record_vote(
                     user_id, payment, provider, SCOPE_PAYMENT, VOTE_SUCCESS
                 )
-                await self.whitelist_manager.add_address(payment, 'payment', '用户反馈：仅收款地址成功', user_id, is_provisional=True)
+                await self.whitelist_manager.add_address(payment, 'payment', '用户反馈：仅收款地址成功', user_id, is_provisional=True, from_feedback=True)
                 status_text = await self._sync_single_status(payment, 'payment', VOTE_SUCCESS)
                 # 发送确认消息
                 await context.bot.send_message(
@@ -1062,7 +1056,7 @@ class TronEnergyBot:
                 await self.feedback_manager.record_vote(
                     user_id, payment, provider, SCOPE_PROVIDER, VOTE_SUCCESS
                 )
-                await self.whitelist_manager.add_address(provider, 'provider', '用户反馈：仅提供方成功', user_id, is_provisional=True)
+                await self.whitelist_manager.add_address(provider, 'provider', '用户反馈：仅提供方成功', user_id, is_provisional=True, from_feedback=True)
                 status_text = await self._sync_single_status(provider, 'provider', VOTE_SUCCESS)
                 # 发送确认消息
                 await context.bot.send_message(
@@ -1083,7 +1077,7 @@ class TronEnergyBot:
                 await self.feedback_manager.record_vote(
                     user_id, payment, provider, SCOPE_PAYMENT, VOTE_FAIL
                 )
-                await self.blacklist_manager.add_to_blacklist(payment, '用户反馈：仅收款地址有问题', user_id, 'manual', is_provisional=True)
+                await self.blacklist_manager.add_to_blacklist(payment, '用户反馈：仅收款地址有问题', user_id, 'manual', is_provisional=True, from_feedback=True)
                 status_text = await self._sync_single_status(payment, 'payment', VOTE_FAIL)
                 # 发送确认消息
                 await context.bot.send_message(
@@ -1104,7 +1098,7 @@ class TronEnergyBot:
                 await self.feedback_manager.record_vote(
                     user_id, payment, provider, SCOPE_PROVIDER, VOTE_FAIL
                 )
-                await self.blacklist_manager.add_to_blacklist(provider, '用户反馈：仅提供方有问题', user_id, 'manual', is_provisional=True)
+                await self.blacklist_manager.add_to_blacklist(provider, '用户反馈：仅提供方有问题', user_id, 'manual', is_provisional=True, from_feedback=True)
                 status_text = await self._sync_single_status(provider, 'provider', VOTE_FAIL)
                 try:
                     await self.blacklist_manager.auto_associate_addresses(payment, provider)
@@ -1171,47 +1165,73 @@ class TronEnergyBot:
         except Exception as e:
             logger.error(f"处理回调失败: {e}")
             
+    async def _reconcile_address_lists(self, address: str, address_type: str) -> Dict[str, int]:
+        """按该地址当前的有效票数重算白/黑名单归属，返回各票种票数
+
+        投票允许改主意：record_vote 的 ON CONFLICT 直接覆盖 vote_type，旧票随之消失。
+        若只写入新票对应的那张表，旧票留下的另一张表记录不会被清掉，地址会同时躺在
+        白名单和黑名单里；而查询是白名单优先，更新的那次反馈反而被旧记录屏蔽。
+        所以投票、撤票后都必须按票数重算两张表，而不是只动一边。
+
+        清理只针对 from_feedback 行：管理员手工添加、自动关联产生的条目不受投票影响，
+        否则一个人的一票就能把这些条目冲掉。
+        """
+        counts = await self.feedback_manager.count_address_votes(address, address_type)
+        success_votes = counts.get(VOTE_SUCCESS, 0)
+        fail_votes = counts.get(VOTE_FAIL, 0)
+
+        if success_votes == 0:
+            await self.whitelist_manager.remove_address(address, address_type, only_feedback=True)
+        else:
+            await self.whitelist_manager.set_provisional(
+                address, address_type, success_votes < CONFIRM_THRESHOLD
+            )
+
+        if fail_votes == 0:
+            await self.blacklist_manager.remove_from_blacklist(address, only_feedback=True)
+        else:
+            await self.blacklist_manager.set_provisional(
+                address, fail_votes < CONFIRM_THRESHOLD
+            )
+
+        return counts
+
+    @staticmethod
+    def _vote_status_suffix(votes: int) -> str:
+        """票数转成"临时/已确认"展示后缀"""
+        if votes < CONFIRM_THRESHOLD:
+            return f"（临时，{votes} 票）"
+        return f"（已确认，{votes} 票）"
+
     async def _sync_single_status(self, address: str, address_type: str, vote_type: str) -> str:
-        """按该地址的同向票数决定名单条目是临时还是正式，返回展示后缀"""
+        """单边投票后重算该地址的名单归属，返回展示后缀"""
         try:
-            if address_type == 'payment':
-                counts = await self.feedback_manager.count_votes(payment_address=address)
-            else:
-                counts = await self.feedback_manager.count_votes(provider_address=address)
-            votes = counts.get(vote_type, 0)
-            is_provisional = votes < CONFIRM_THRESHOLD
-            if vote_type == VOTE_SUCCESS:
-                await self.whitelist_manager.set_provisional(address, address_type, is_provisional)
-            else:
-                await self.blacklist_manager.set_provisional(address, is_provisional)
-            return f"（临时，{votes} 票）" if is_provisional else f"（已确认，{votes} 票）"
+            counts = await self._reconcile_address_lists(address, address_type)
+            return self._vote_status_suffix(counts.get(vote_type, 0))
         except Exception as e:
             logger.error(f"同步名单状态失败: {e}")
             return "（临时）"
 
-    async def _sync_pair_status(self, payment: str, provider: str) -> str:
-        """组合投票后同步双方及组合状态"""
+    async def _sync_pair_status(self, payment: str, provider: str, vote_type: str) -> str:
+        """组合投票后重算双方及组合的名单归属，返回展示后缀"""
         try:
+            await self._reconcile_address_lists(payment, 'payment')
+            await self._reconcile_address_lists(provider, 'provider')
+
             counts = await self.feedback_manager.count_votes(
                 payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
             )
             success_votes = counts.get(VOTE_SUCCESS, 0)
             fail_votes = counts.get(VOTE_FAIL, 0)
-            if success_votes >= fail_votes:
-                vote_type, votes = VOTE_SUCCESS, success_votes
-            else:
-                vote_type, votes = VOTE_FAIL, fail_votes
-            is_provisional = votes < CONFIRM_THRESHOLD
 
-            if vote_type == VOTE_SUCCESS:
-                await self.whitelist_manager.set_provisional(payment, 'payment', is_provisional)
-                await self.whitelist_manager.set_provisional(provider, 'provider', is_provisional)
-                await self.whitelist_manager.set_pair_provisional(payment, provider, is_provisional)
+            if success_votes == 0:
+                await self.whitelist_manager.remove_pair(payment, provider)
             else:
-                await self.blacklist_manager.set_provisional(payment, is_provisional)
-                await self.blacklist_manager.set_provisional(provider, is_provisional)
+                await self.whitelist_manager.set_pair_provisional(
+                    payment, provider, success_votes < CONFIRM_THRESHOLD
+                )
 
-            suffix = f"（临时，{votes} 票）" if is_provisional else f"（已确认，{votes} 票）"
+            suffix = self._vote_status_suffix(counts.get(vote_type, 0))
             if success_votes and fail_votes:
                 suffix += f"\n• 该组合当前反馈：成功 {success_votes} 票 / 未成功 {fail_votes} 票"
             return suffix
@@ -1229,25 +1249,7 @@ class TronEnergyBot:
                 return False
 
             for address, address_type in ((payment, 'payment'), (provider, 'provider')):
-                if address_type == 'payment':
-                    counts = await self.feedback_manager.count_votes(payment_address=address)
-                else:
-                    counts = await self.feedback_manager.count_votes(provider_address=address)
-
-                if counts.get(VOTE_SUCCESS, 0) == 0:
-                    await self.whitelist_manager.remove_address(address, address_type)
-                else:
-                    await self.whitelist_manager.set_provisional(
-                        address, address_type,
-                        counts[VOTE_SUCCESS] < CONFIRM_THRESHOLD
-                    )
-
-                if counts.get(VOTE_FAIL, 0) == 0:
-                    await self.blacklist_manager.remove_from_blacklist(address)
-                else:
-                    await self.blacklist_manager.set_provisional(
-                        address, counts[VOTE_FAIL] < CONFIRM_THRESHOLD
-                    )
+                await self._reconcile_address_lists(address, address_type)
 
             pair_counts = await self.feedback_manager.count_votes(
                 payment_address=payment, provider_address=provider, scope=SCOPE_PAIR

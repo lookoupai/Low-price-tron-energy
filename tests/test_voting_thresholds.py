@@ -1,100 +1,168 @@
 """
-测试投票阈值与状态计算
+测试投票后的名单重算逻辑
 
-验证黑名单/白名单的临时与正式状态转换逻辑
+背景：投票允许改主意——record_vote 的 ON CONFLICT 会覆盖 vote_type，旧票随之消失。
+早先只写入新票对应的那张表，旧票留下的另一张表记录不会被清掉，地址会同时躺在
+白名单和黑名单里；而查询是白名单优先，于是更新的那次反馈被旧记录屏蔽。
+现在每次投票/撤票都按当前票数重算两张表。
 """
+from types import SimpleNamespace
+
 import pytest
 
+from feedback_manager import CONFIRM_THRESHOLD, VOTE_FAIL, VOTE_SUCCESS
+from telegram_bot import TronEnergyBot
 
-class TestVotingThresholds:
-    """投票阈值测试"""
+reconcile = TronEnergyBot._reconcile_address_lists
+suffix = TronEnergyBot._vote_status_suffix
 
-    def test_one_vote_is_provisional(self):
-        """1 票应标记为临时状态"""
-        status = calculate_vote_status(success_votes=1, fail_votes=0)
-        assert status["is_provisional"] is True
-        assert status["status"] == "whitelist_provisional"
-
-    def test_two_votes_is_confirmed(self):
-        """2 票及以上应转为正式状态"""
-        status = calculate_vote_status(success_votes=2, fail_votes=0)
-        assert status["is_provisional"] is False
-        assert status["status"] == "whitelist_confirmed"
-
-        status = calculate_vote_status(success_votes=5, fail_votes=0)
-        assert status["is_provisional"] is False
-
-    def test_zero_votes_no_status(self):
-        """0 票应无状态"""
-        status = calculate_vote_status(success_votes=0, fail_votes=0)
-        assert status["status"] == "none"
-
-    def test_conflicting_votes_both_shown(self):
-        """黑白票同时存在时应展示双方票数"""
-        status = calculate_vote_status(success_votes=3, fail_votes=2)
-        assert status["success_votes"] == 3
-        assert status["fail_votes"] == 2
-        assert status["status"] == "conflicting"
-
-    def test_blacklist_voting(self):
-        """黑名单投票测试"""
-        status = calculate_vote_status(success_votes=0, fail_votes=1)
-        assert status["is_provisional"] is True
-        assert status["status"] == "blacklist_provisional"
-
-        status = calculate_vote_status(success_votes=0, fail_votes=2)
-        assert status["is_provisional"] is False
-        assert status["status"] == "blacklist_confirmed"
-
-    def test_tie_votes(self):
-        """平票情况"""
-        status = calculate_vote_status(success_votes=1, fail_votes=1)
-        assert status["status"] == "conflicting"
-        assert status["success_votes"] == 1
-        assert status["fail_votes"] == 1
+PAYMENT = "TPayeeAddress0000000000000000000002"
+PROVIDER = "TProviderAddress00000000000000000003"
 
 
-def calculate_vote_status(success_votes: int, fail_votes: int) -> dict:
-    """
-    根据投票数计算名单状态
+class FakeFeedback:
+    """只按 (地址, 角色) 返回预设票数"""
 
-    规则：
-    - 0 票：无状态
-    - 1 票：临时状态（whitelist_provisional 或 blacklist_provisional）
-    - ≥2 票：正式状态（whitelist_confirmed 或 blacklist_confirmed）
-    - 黑白票都有：conflicting（展示双方票数）
+    def __init__(self, counts):
+        self._counts = counts
 
-    实际实现在 feedback_manager.py 和 telegram_bot.py 的状态判断中
-    """
-    CONFIRM_THRESHOLD = 2
+    async def count_address_votes(self, address, address_type):
+        return dict(
+            self._counts.get((address, address_type), {VOTE_SUCCESS: 0, VOTE_FAIL: 0})
+        )
 
-    if success_votes == 0 and fail_votes == 0:
-        return {"status": "none", "is_provisional": False}
 
-    if success_votes > 0 and fail_votes > 0:
-        return {
-            "status": "conflicting",
-            "success_votes": success_votes,
-            "fail_votes": fail_votes,
-            "is_provisional": False,
-        }
+class FakeWhitelist:
+    def __init__(self):
+        self.removed = []
+        self.provisional = []
 
-    if success_votes > 0:
-        is_provisional = success_votes < CONFIRM_THRESHOLD
-        return {
-            "status": "whitelist_provisional" if is_provisional else "whitelist_confirmed",
-            "is_provisional": is_provisional,
-            "success_votes": success_votes,
-            "fail_votes": 0,
-        }
+    async def remove_address(self, address, address_type, only_feedback=False):
+        self.removed.append((address, address_type, only_feedback))
 
-    if fail_votes > 0:
-        is_provisional = fail_votes < CONFIRM_THRESHOLD
-        return {
-            "status": "blacklist_provisional" if is_provisional else "blacklist_confirmed",
-            "is_provisional": is_provisional,
-            "success_votes": 0,
-            "fail_votes": fail_votes,
-        }
+    async def set_provisional(self, address, address_type, is_provisional):
+        self.provisional.append((address, address_type, is_provisional))
 
-    return {"status": "none", "is_provisional": False}
+
+class FakeBlacklist:
+    def __init__(self):
+        self.removed = []
+        self.provisional = []
+
+    async def remove_from_blacklist(self, address, only_feedback=False):
+        self.removed.append((address, only_feedback))
+
+    async def set_provisional(self, address, is_provisional):
+        self.provisional.append((address, is_provisional))
+
+
+def make_bot(counts=None):
+    return SimpleNamespace(
+        feedback_manager=FakeFeedback(counts or {}),
+        whitelist_manager=FakeWhitelist(),
+        blacklist_manager=FakeBlacklist(),
+    )
+
+
+def votes(success=0, fail=0):
+    return {VOTE_SUCCESS: success, VOTE_FAIL: fail}
+
+
+class TestVoteFlipReconciliation:
+    """改票后两张名单都要重算"""
+
+    async def test_flip_success_to_fail_drops_whitelist_row(self):
+        """成功改判未成功：旧的白名单记录必须被移除，否则白名单优先会屏蔽新票"""
+        bot = make_bot({(PAYMENT, 'payment'): votes(success=0, fail=1)})
+        await reconcile(bot, PAYMENT, 'payment')
+
+        assert bot.whitelist_manager.removed == [(PAYMENT, 'payment', True)]
+        assert bot.whitelist_manager.provisional == []
+        assert bot.blacklist_manager.provisional == [(PAYMENT, True)]
+        assert bot.blacklist_manager.removed == []
+
+    async def test_flip_fail_to_success_drops_blacklist_row(self):
+        """未成功改判成功：旧的黑名单记录必须被移除"""
+        bot = make_bot({(PROVIDER, 'provider'): votes(success=1, fail=0)})
+        await reconcile(bot, PROVIDER, 'provider')
+
+        assert bot.blacklist_manager.removed == [(PROVIDER, True)]
+        assert bot.blacklist_manager.provisional == []
+        assert bot.whitelist_manager.provisional == [(PROVIDER, 'provider', True)]
+
+    async def test_cleanup_never_touches_non_feedback_rows(self):
+        """清理必须带 only_feedback，管理员手工条目不能被投票冲掉"""
+        bot = make_bot()
+        await reconcile(bot, PAYMENT, 'payment')
+
+        assert all(call[-1] is True for call in bot.whitelist_manager.removed)
+        assert all(call[-1] is True for call in bot.blacklist_manager.removed)
+
+    async def test_no_votes_clears_both_lists(self):
+        """票数归零（撤回）时两张表都要清掉"""
+        bot = make_bot()
+        await reconcile(bot, PAYMENT, 'payment')
+
+        assert bot.whitelist_manager.removed == [(PAYMENT, 'payment', True)]
+        assert bot.blacklist_manager.removed == [(PAYMENT, True)]
+
+    async def test_conflicting_votes_keep_both_rows(self):
+        """不同用户投出相反票时两条记录都保留，交由白名单优先规则裁决"""
+        bot = make_bot({(PAYMENT, 'payment'): votes(success=1, fail=1)})
+        await reconcile(bot, PAYMENT, 'payment')
+
+        assert bot.whitelist_manager.removed == []
+        assert bot.blacklist_manager.removed == []
+        assert bot.whitelist_manager.provisional == [(PAYMENT, 'payment', True)]
+        assert bot.blacklist_manager.provisional == [(PAYMENT, True)]
+
+    async def test_reconcile_returns_current_counts(self):
+        """返回值用于生成"临时/已确认"后缀"""
+        bot = make_bot({(PAYMENT, 'payment'): votes(success=3, fail=1)})
+        counts = await reconcile(bot, PAYMENT, 'payment')
+
+        assert counts == {VOTE_SUCCESS: 3, VOTE_FAIL: 1}
+
+    async def test_payment_and_provider_counted_separately(self):
+        """同一次调用只处理传入的那个角色，另一个地址不受影响"""
+        bot = make_bot({
+            (PAYMENT, 'payment'): votes(success=2, fail=0),
+            (PROVIDER, 'provider'): votes(success=0, fail=0),
+        })
+        await reconcile(bot, PAYMENT, 'payment')
+
+        assert bot.whitelist_manager.provisional == [(PAYMENT, 'payment', False)]
+        assert bot.whitelist_manager.removed == []
+
+
+class TestThresholdPromotion:
+    """票数达到阈值后从临时转正式"""
+
+    async def test_single_vote_stays_provisional(self):
+        bot = make_bot({(PAYMENT, 'payment'): votes(success=1)})
+        await reconcile(bot, PAYMENT, 'payment')
+        assert bot.whitelist_manager.provisional == [(PAYMENT, 'payment', True)]
+
+    async def test_threshold_votes_become_confirmed(self):
+        bot = make_bot({(PAYMENT, 'payment'): votes(success=CONFIRM_THRESHOLD)})
+        await reconcile(bot, PAYMENT, 'payment')
+        assert bot.whitelist_manager.provisional == [(PAYMENT, 'payment', False)]
+
+    async def test_blacklist_threshold_becomes_confirmed(self):
+        bot = make_bot({(PROVIDER, 'provider'): votes(fail=CONFIRM_THRESHOLD)})
+        await reconcile(bot, PROVIDER, 'provider')
+        assert bot.blacklist_manager.provisional == [(PROVIDER, False)]
+
+
+class TestStatusSuffix:
+    """展示后缀"""
+
+    def test_below_threshold_is_provisional(self):
+        assert suffix(1) == "（临时，1 票）"
+
+    def test_at_threshold_is_confirmed(self):
+        assert suffix(CONFIRM_THRESHOLD).startswith("（已确认")
+
+    def test_zero_votes_is_provisional(self):
+        assert suffix(0) == "（临时，0 票）"
+
