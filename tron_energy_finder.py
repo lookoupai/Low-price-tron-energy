@@ -46,6 +46,10 @@ ENERGY_PRICE_TTL = 600
 TRON_FULLNODE_API = "https://api.trongrid.io"
 # 拉取能量参数时使用的占位地址（接口要求传地址，返回的全网字段与地址无关）
 ENERGY_PARAM_PROBE_ADDRESS = "TZ4UXDV5ZhNW7fb2AMSbgfAEZ7hWsnYS2g"
+# 单个 API Key 每秒请求上限（TronScan 限制）
+MAX_REQUESTS_PER_SECOND = 5
+# 单个进程每日请求上限
+MAX_DAILY_REQUESTS = 100000
 
 class APIKeyManager:
     def __init__(self, api_keys: List[str]):
@@ -56,42 +60,47 @@ class APIKeyManager:
         self.daily_request_count = 0  # 记录当天的总请求次数
         self.last_reset_time = datetime.now()  # 上次重置计数的时间
         self._lock = asyncio.Lock()
-        
+
     async def get_next_key(self) -> str:
-        """获取下一个可用的 API Key"""
-        async with self._lock:
-            # 检查是否需要重置每日计数
-            now = datetime.now()
-            if now.date() > self.last_reset_time.date():
-                self.daily_request_count = 0
-                self.last_reset_time = now
-            
-            # 检查是否达到每日限制
-            if self.daily_request_count >= 100000:
-                raise Exception("已达到每日 API 请求限制")
-            
-            # 清理超过1秒的请求记录
-            current_time = time.time()
-            for key in self.api_keys:
-                self.request_times[key] = [t for t in self.request_times[key] 
-                                         if current_time - t < 1]
-            
-            # 查找可用的 key
-            for _ in range(len(self.api_keys)):
-                key = self.api_keys[self.current_key_index]
-                if len(self.request_times[key]) < 5:  # 每秒限制5次
-                    self.request_times[key].append(current_time)
-                    self.daily_request_count += 1
-                    return key
-                
-                self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
-            
-            # 如果所有 key 都达到限制，等待最早的请求过期
-            earliest_time = min(min(times) for times in self.request_times.values() if times)
-            wait_time = max(0, 1 - (current_time - earliest_time))
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-            return await self.get_next_key()
+        """获取下一个可用的 API Key
+
+        用循环代替递归：限流等待必须在释放锁之后进行，
+        否则持锁递归会等待自己持有的锁，造成永久死锁。
+        """
+        while True:
+            async with self._lock:
+                # 检查是否需要重置每日计数
+                now = datetime.now()
+                if now.date() > self.last_reset_time.date():
+                    self.daily_request_count = 0
+                    self.last_reset_time = now
+
+                # 检查是否达到每日限制
+                if self.daily_request_count >= MAX_DAILY_REQUESTS:
+                    raise Exception("已达到每日 API 请求限制")
+
+                # 清理超过1秒的请求记录
+                current_time = time.time()
+                for key in self.api_keys:
+                    self.request_times[key] = [t for t in self.request_times[key]
+                                               if current_time - t < 1]
+
+                # 查找可用的 key
+                for _ in range(len(self.api_keys)):
+                    key = self.api_keys[self.current_key_index]
+                    if len(self.request_times[key]) < MAX_REQUESTS_PER_SECOND:
+                        self.request_times[key].append(current_time)
+                        self.daily_request_count += 1
+                        return key
+
+                    self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+
+                # 所有 key 都触发限流，计算最早请求还需多久过期
+                active_times = [t for times in self.request_times.values() for t in times]
+                wait_time = max(0.01, 1 - (current_time - min(active_times))) if active_times else 0.01
+
+            # 锁已释放，再等待限流窗口过期
+            await asyncio.sleep(wait_time)
 
 class TronEnergyFinder:
     def __init__(self):
