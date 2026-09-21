@@ -53,6 +53,9 @@ MAX_REQUESTS_PER_SECOND = 5
 MAX_DAILY_REQUESTS = 100000
 # 一次配对窗口预取的连续区块数（3 秒一块，6 块约覆盖 18 秒）
 PAIRING_WINDOW_BLOCKS = 6
+# 旧区块不会被下一小时的任务再用，无上限会把交易原文一直堆在进程里
+BLOCK_CACHE_MAX_BLOCKS = 64
+BLOCK_CACHE_TTL_SECONDS = 1800
 # 付款后多久收到能量代理才算真到账；超时到账多为买家换供应方重试，无因果关系
 MAX_DELIVERY_DELAY_MS = 10_000
 # 判定靠谱度所需的最少到账观测样本，低于此数只报"样本不足"
@@ -194,7 +197,10 @@ class TronEnergyFinder:
         self.last_cleanup_date = None           # 记录最后清理的日期，避免同一天重复清理
         
         # 初始化缓存
-        self._block_cache = {}  # 区块缓存
+        self._block_cache = TTLCache(
+            maxsize=BLOCK_CACHE_MAX_BLOCKS,
+            ttl=BLOCK_CACHE_TTL_SECONDS,
+        )
         self._analyzed_addresses = set()  # 已分析的地址集合
         self._energy_amount_cache = {}  # 能量数量缓存
         self._transaction_info_cache = {}  # 交易信息缓存
@@ -945,6 +951,34 @@ class TronEnergyFinder:
 """
         logger.info(result_text)
 
+    @staticmethod
+    def _slim_payment(tx: Dict) -> Dict:
+        """只保留配对和展示用到的转账字段，丢掉 TronScan 返回的其余原文"""
+        return {
+            "contractType": tx.get("contractType"),
+            "hash": tx.get("hash"),
+            "timestamp": tx.get("timestamp", 0),
+            "ownerAddress": tx.get("ownerAddress"),
+            "toAddress": tx.get("toAddress"),
+            "amount": tx.get("amount"),
+        }
+
+    @staticmethod
+    def _slim_proxy(tx: Dict) -> Dict:
+        """只保留配对、到账率计算和能量回退换算用到的代理字段"""
+        contract_data = tx.get("contractData") or {}
+        return {
+            "contractType": tx.get("contractType"),
+            "hash": tx.get("hash"),
+            "timestamp": tx.get("timestamp", 0),
+            "contractData": {
+                "resource": contract_data.get("resource"),
+                "balance": contract_data.get("balance"),
+                "owner_address": contract_data.get("owner_address"),
+                "receiver_address": contract_data.get("receiver_address"),
+            },
+        }
+
     async def get_block_transactions(self, block_number: int) -> Dict[str, List[Dict]]:
         """获取区块交易详情，返回 Type-1 转账和 Type-57 代理交易"""
         try:
@@ -1015,7 +1049,7 @@ class TronEnergyFinder:
 
                 # Type-1: TRX 转账
                 if contract_type == 1 and "amount" in tx:
-                    payment_transactions.append(tx)
+                    payment_transactions.append(self._slim_payment(tx))
                 # Type-57: 代理资源交易
                 elif contract_type == 57:
                     if (contract_data.get("resource") == "ENERGY" and
@@ -1023,7 +1057,7 @@ class TronEnergyFinder:
                         "receiver_address" in contract_data and
                         "owner_address" in contract_data):
 
-                        proxy_transactions.append(tx)
+                        proxy_transactions.append(self._slim_proxy(tx))
                         logger.info(f"找到代理资源交易:\n"
                                   f"交易哈希: {tx.get('hash')}\n"
                                   f"发送人: {contract_data.get('owner_address')}\n"
