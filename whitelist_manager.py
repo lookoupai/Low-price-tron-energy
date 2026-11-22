@@ -2,7 +2,7 @@ import asyncpg
 import logging
 from typing import Dict, Optional
 from cachetools import TTLCache
-from db import get_db_pool
+from db import db_connection, get_db_pool
 
 
 logger = logging.getLogger(__name__)
@@ -89,8 +89,7 @@ class WhitelistManager:
             return False
         if address_type not in ("payment", "provider"):
             return False
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO whitelist (address, address_type, reason, added_by, is_provisional, from_feedback)
@@ -121,11 +120,10 @@ class WhitelistManager:
         only_feedback=True 时只停用纯粹由投票产生的行，用于票数归零后的重算，
         避免管理员手工添加的条目被投票撤销。
         """
-        pool = await get_db_pool()
         query = "UPDATE whitelist SET is_active = false WHERE address = $1 AND address_type = $2"
         if only_feedback:
             query += " AND from_feedback = true"
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             await conn.execute(query, address, address_type)
         self._cache.pop((address, address_type), None)
         return True
@@ -155,8 +153,7 @@ class WhitelistManager:
     async def add_pair(self, payment_address: str, provider_address: str, added_by: Optional[int], is_provisional: bool = True) -> bool:
         if not (self._validate_tron_address(payment_address) and self._validate_tron_address(provider_address)):
             return False
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO whitelist_pairs (payment_address, provider_address, is_provisional, added_by)
@@ -191,8 +188,7 @@ class WhitelistManager:
             return dict(row) if row else None
 
     async def remove_pair(self, payment_address: str, provider_address: str) -> bool:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             await conn.execute(
                 "UPDATE whitelist_pairs SET is_active = false WHERE payment_address = $1 AND provider_address = $2",
                 payment_address,
@@ -202,8 +198,7 @@ class WhitelistManager:
 
     async def set_provisional(self, address: str, address_type: str, is_provisional: bool) -> bool:
         """仅更新临时标记，不叠加 success_count"""
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             await conn.execute(
                 "UPDATE whitelist SET is_provisional = $3 WHERE address = $1 AND address_type = $2",
                 address,
@@ -214,8 +209,7 @@ class WhitelistManager:
         return True
 
     async def set_pair_provisional(self, payment_address: str, provider_address: str, is_provisional: bool) -> bool:
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             await conn.execute(
                 "UPDATE whitelist_pairs SET is_provisional = $3 WHERE payment_address = $1 AND provider_address = $2",
                 payment_address,

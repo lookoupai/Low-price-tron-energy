@@ -6,6 +6,8 @@
 import asyncpg
 import logging
 import os
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -74,6 +76,33 @@ _db_pool = DatabasePool()
 async def get_db_pool() -> asyncpg.Pool:
     """获取全局共享连接池"""
     return await _db_pool.get_pool()
+
+
+_transaction_connection = ContextVar("transaction_connection", default=None)
+
+
+@asynccontextmanager
+async def db_connection():
+    current = _transaction_connection.get()
+    if current is not None:
+        yield current
+    else:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            yield conn
+
+
+@asynccontextmanager
+async def feedback_transaction(payment: str, provider: str):
+    """Serialize overlapping address updates and commit votes and lists together."""
+    async with db_connection() as conn, conn.transaction():
+        for address in sorted({payment, provider}):
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", address)
+        token = _transaction_connection.set(conn)
+        try:
+            yield
+        finally:
+            _transaction_connection.reset(token)
 
 
 async def close_db_pool() -> None:

@@ -7,7 +7,7 @@ from cachetools import TTLCache
 import os
 from dotenv import load_dotenv
 from settings_manager import SettingsManager
-from db import get_db_pool
+from db import db_connection, get_db_pool
 
 load_dotenv()
 
@@ -84,8 +84,7 @@ class BlacklistManager:
             if not self._validate_tron_address(address):
                 return False
 
-            pool = await get_db_pool()
-            async with pool.acquire() as connection:
+            async with db_connection() as connection:
                 await connection.execute('''
                     INSERT INTO blacklist (address, reason, type, added_by, is_provisional, from_feedback)
                     VALUES ($1, $2, $3, $4, $5, $6)
@@ -154,11 +153,10 @@ class BlacklistManager:
         避免管理员手工添加或自动关联产生的条目被投票撤销。
         """
         try:
-            pool = await get_db_pool()
             query = 'UPDATE blacklist SET is_active = false WHERE address = $1'
             if only_feedback:
                 query += ' AND from_feedback = true'
-            async with pool.acquire() as connection:
+            async with db_connection() as connection:
                 await connection.execute(query, address)
                 
             # 清除缓存
@@ -174,8 +172,7 @@ class BlacklistManager:
     async def set_provisional(self, address: str, is_provisional: bool) -> bool:
         """仅更新临时标记，不改动其它字段"""
         try:
-            pool = await get_db_pool()
-            async with pool.acquire() as connection:
+            async with db_connection() as connection:
                 await connection.execute('''
                     UPDATE blacklist
                     SET is_provisional = $2
@@ -293,4 +290,3 @@ class BlacklistManager:
     async def close(self):
         """关闭方法保留以兼容现有代码，实际连接池由 db.py 统一管理"""
         pass
- 

@@ -2,9 +2,10 @@ import asyncpg
 import logging
 import os
 from datetime import timedelta
+from hashlib import sha256
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
-from db import get_db_pool
+from db import db_connection, get_db_pool
 
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,15 @@ class FeedbackManager:
         async with pool.acquire() as conn:
             await conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS feedback_card_pairs (
+                    card_key TEXT PRIMARY KEY,
+                    payment_address VARCHAR(50) NOT NULL,
+                    provider_address VARCHAR(50) NOT NULL
+                )
+                """
+            )
+            await conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS address_feedback (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
@@ -66,8 +76,23 @@ class FeedbackManager:
                 "CREATE INDEX IF NOT EXISTS idx_feedback_user ON address_feedback(user_id)"
             )
 
-    async def _ensure_pool(self) -> asyncpg.Pool:
-        return await get_db_pool()
+    async def card_key(self, payment: str, provider: str) -> str:
+        key = 'p' + sha256(f'{payment}:{provider}'.encode()).hexdigest()[:32]
+        async with db_connection() as conn:
+            await conn.execute(
+                """INSERT INTO feedback_card_pairs VALUES ($1, $2, $3)
+                   ON CONFLICT (card_key) DO NOTHING""",
+                key, payment, provider,
+            )
+        return key
+
+    async def card_addresses(self, key: str) -> Optional[tuple[str, str]]:
+        async with db_connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT payment_address, provider_address FROM feedback_card_pairs WHERE card_key = $1",
+                key,
+            )
+        return tuple(row) if row else None
 
     async def record_vote(
         self,
@@ -76,11 +101,10 @@ class FeedbackManager:
         provider_address: str,
         scope: str,
         vote_type: str,
-    ) -> None:
+    ) -> bool:
         """记录一次投票，同一用户同范围重复投票只覆盖不叠加"""
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
-            await conn.execute(
+        async with db_connection() as conn:
+            changed = await conn.fetchval(
                 """
                 INSERT INTO address_feedback
                     (user_id, payment_address, provider_address, scope, vote_type)
@@ -90,6 +114,9 @@ class FeedbackManager:
                     vote_type = EXCLUDED.vote_type,
                     created_at = NOW(),
                     revoked_at = NULL
+                WHERE address_feedback.vote_type <> EXCLUDED.vote_type
+                   OR address_feedback.revoked_at IS NOT NULL
+                RETURNING true
                 """,
                 user_id,
                 payment_address,
@@ -97,6 +124,7 @@ class FeedbackManager:
                 scope,
                 vote_type,
             )
+        return bool(changed)
 
     async def count_votes(
         self,
@@ -109,7 +137,6 @@ class FeedbackManager:
         payment_address / provider_address 任一给出即按该地址统计，
         两者都给出时统计同时命中的记录。
         """
-        pool = await self._ensure_pool()
 
         conditions = ["revoked_at IS NULL"]
         params: List[object] = []
@@ -127,7 +154,7 @@ class FeedbackManager:
             "SELECT vote_type, COUNT(*) AS cnt FROM address_feedback "
             f"WHERE {' AND '.join(conditions)} GROUP BY vote_type"
         )
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             rows = await conn.fetch(query, *params)
 
         counts = {VOTE_SUCCESS: 0, VOTE_FAIL: 0}
@@ -141,13 +168,12 @@ class FeedbackManager:
         收款地址只统计组合票与"仅收款地址"票，能量提供方只统计组合票与
         "仅提供方"票。否则「仅提供方有问题」这类单边票会被算到另一个地址头上。
         """
-        pool = await self._ensure_pool()
         if address_type == 'payment':
             column, scopes = "payment_address", [SCOPE_PAIR, SCOPE_PAYMENT]
         else:
             column, scopes = "provider_address", [SCOPE_PAIR, SCOPE_PROVIDER]
 
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             rows = await conn.fetch(
                 f"""
                 SELECT vote_type, COUNT(*) AS cnt
@@ -173,11 +199,11 @@ class FeedbackManager:
         provider_address: str,
     ) -> List[Dict]:
         """取用户对该组合的所有未撤回投票"""
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             rows = await conn.fetch(
                 """
-                SELECT scope, vote_type, created_at
+                SELECT scope, vote_type, created_at,
+                       created_at > NOW() - $4::interval AS can_revoke
                 FROM address_feedback
                 WHERE user_id = $1
                   AND payment_address = $2
@@ -187,6 +213,7 @@ class FeedbackManager:
                 user_id,
                 payment_address,
                 provider_address,
+                REVOKE_WINDOW,
             )
         return [dict(row) for row in rows]
 
@@ -197,9 +224,8 @@ class FeedbackManager:
         provider_address: str,
     ) -> List[Dict]:
         """撤回用户在时间窗内的投票，返回被撤回的记录"""
-        pool = await self._ensure_pool()
         window_seconds = int(REVOKE_WINDOW.total_seconds())
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             rows = await conn.fetch(
                 f"""
                 UPDATE address_feedback
@@ -218,8 +244,7 @@ class FeedbackManager:
         return [dict(row) for row in rows]
 
     async def get_stats(self) -> Dict:
-        pool = await self._ensure_pool()
-        async with pool.acquire() as conn:
+        async with db_connection() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT

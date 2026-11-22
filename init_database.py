@@ -39,7 +39,7 @@ async def init_database():
         print("- whitelist / whitelist_pairs")
         print("- bot_settings")
         print("- push_channels / push_history")
-        print("- address_feedback")
+        print("- address_feedback / feedback_card_pairs")
         print("- delivery_observations")
 
         await close_db_pool()

@@ -7,7 +7,7 @@ import time
 import re
 from collections import defaultdict
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -36,6 +36,10 @@ from feedback_manager import (
     VOTE_FAIL,
 )
 from delivery_stats_store import DeliveryStatsStore
+from db import feedback_transaction
+from feedback_ui import (
+    SCOPE_LABELS, VOTE_ACTIONS, button, close_panel, ephemeral_id, personal_panel, public_keyboard, show_panel,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -94,9 +98,6 @@ class TronEnergyBot:
         # TRON地址检测正则表达式
         self.tron_address_pattern = re.compile(r'\b(T[1-9A-HJ-NP-Za-km-z]{33})\b')
         
-        # 回调负载缓存（避免超长callback_data）- 延长到7天
-        self._cb_payloads: TTLCache = TTLCache(maxsize=1000, ttl=604800)  # 7天 = 7*24*3600秒
-
     def _format_price_range(self, min_trx: float, max_trx: float) -> str:
         if min_trx == max_trx:
             return f"{min_trx:g} TRX"
@@ -140,50 +141,16 @@ class TronEnergyBot:
         except Exception:
             raise ValueError("价格格式无效")
 
-    def _store_cb_payload(self, payment: str, provider: str) -> str:
-        import uuid
-        key = uuid.uuid4().hex[:10]
-        self._cb_payloads[key] = (payment, provider)
-        return key
+    @staticmethod
+    def _parse_message_for_addresses(message_text: str) -> Optional[tuple[str, str]]:
+        """Recover only the labelled addresses, in rendered text or raw Markdown."""
+        pattern = r"^[ \t]*(?:🔹[ \t]*)?【(收款地址|能量提供方)】[：:][ \t]*`?(T[1-9A-HJ-NP-Za-km-z]{33})`?[ \t]*$"
+        fields = re.findall(pattern, message_text, re.MULTILINE)
+        addresses = dict(fields)
+        if len(fields) == 2 and len(addresses) == 2:
+            return addresses["收款地址"], addresses["能量提供方"]
+        return None
 
-    def _get_cb_payload(self, key: str):
-        return self._cb_payloads.get(key)
-    
-    def _parse_message_for_addresses(self, message_text: str) -> Optional[tuple]:
-        """从消息文本中解析收款地址和能量提供方作为兜底方案"""
-        try:
-            lines = message_text.split('\n')
-            payment_address = None
-            provider_address = None
-            
-            for line in lines:
-                # 查找收款地址行
-                if '【收款地址】' in line and '`' in line:
-                    # 提取反引号内的地址
-                    start = line.find('`') + 1
-                    end = line.rfind('`')
-                    if start > 0 and end > start:
-                        payment_address = line[start:end]
-                
-                # 查找能量提供方行  
-                elif '【能量提供方】' in line and '`' in line:
-                    start = line.find('`') + 1
-                    end = line.rfind('`')
-                    if start > 0 and end > start:
-                        provider_address = line[start:end]
-            
-            # 验证提取的地址格式
-            if payment_address and provider_address:
-                if (self.blacklist_manager._validate_tron_address(payment_address) and 
-                    self.blacklist_manager._validate_tron_address(provider_address)):
-                    return (payment_address, provider_address)
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"解析消息文本失败: {e}")
-            return None
-    
     def _is_message_expired(self, message_date, days=7) -> bool:
         """判断消息是否过期（默认7天）"""
         try:
@@ -218,33 +185,11 @@ class TronEnergyBot:
             return False
         return user.id in self.admin_user_ids
 
-    def _build_inline_keyboard(self, addr: Dict) -> InlineKeyboardMarkup:
-        """为单条地址信息构建操作按钮"""
-        payment = addr.get('address')
-        provider = addr.get('energy_provider')
-        payload_key = self._store_cb_payload(payment, provider)
-        buttons = [
-            [
-                InlineKeyboardButton(
-                    text='✅ 我已成功获得能量（两者加入白名单）',
-                    callback_data=f"vote_success:{payload_key}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text='❌ 我未获得能量（两者加入黑名单）',
-                    callback_data=f"vote_fail:{payload_key}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text='▶️ 更多操作',
-                    callback_data=f"more_ops:{payload_key}"
-                )
-            ]
-        ]
-        return InlineKeyboardMarkup(buttons)
-        
+    async def _build_inline_keyboard(self, addr: Dict) -> InlineKeyboardMarkup:
+        payment = addr["address"]
+        key = await self.feedback_manager.card_key(payment, addr["energy_provider"])
+        return public_keyboard(payment, key)
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """处理/start命令"""
         welcome_message = (
@@ -791,7 +736,7 @@ class TronEnergyBot:
             message += "\n⚠️ 黑名单状态：暂无记录\n"
             
         message += f"\n🈹 TRX #{addr['purchase_amount']}\n"
-        message += "\n按钮说明：成功=两者加白；未成功=两者加黑；更多=展开单独添加/撤回"
+        message += "\n到账反馈针对收款地址和提供方；单独反馈或撤回请点「我的反馈」。"
 
         # 如果配置了广告内容，添加到消息末尾
         if self.advertisement:
@@ -866,7 +811,7 @@ class TronEnergyBot:
                 prefix = f"🎯 查询时间：{current_time}\n筛选：{range_text}\n\n"
                 for addr in addresses:
                     text = prefix + self.format_address_info(addr)
-                    markup = self._build_inline_keyboard(addr)
+                    markup = await self._build_inline_keyboard(addr)
                     try:
                         await update.message.reply_text(
                             text=text,
@@ -892,279 +837,114 @@ class TronEnergyBot:
                 await update.message.reply_text("❌ 查询过程中出现错误，请稍后重试")
 
     async def inline_button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """处理内联按钮回调"""
+        query = update.callback_query
+        if not query:
+            return
+        alert = None
         try:
-            query = update.callback_query
-            if not query or not query.data:
-                return
-            
-            # 检查消息是否过期（7天）
-            message_date = query.message.date if query.message else None
-            is_expired = message_date and self._is_message_expired(message_date)
-            
-            action, _, key = query.data.partition(":")
-            payload = self._get_cb_payload(key)
-            
-            # 处理过期或缓存丢失的情况
-            if not payload or is_expired:
-                # 尝试从消息文本解析地址作为兜底
-                fallback_addresses = None
-                if query.message and query.message.text:
-                    fallback_addresses = self._parse_message_for_addresses(query.message.text)
-                
-                if not fallback_addresses:
-                    # 无法解析，提示过期并更新按钮
-                    await query.answer("该消息已过期且无法解析地址信息，请使用最新结果", show_alert=True)
-                    try:
-                        expired_buttons = [[
-                            InlineKeyboardButton("已过期（获取最新）", callback_data="expired_get_new")
-                        ]]
-                        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(expired_buttons))
-                    except Exception:
-                        pass
-                    return
-                else:
-                    # 成功解析到地址，询问是否继续
-                    if action in ['vote_success', 'vote_fail', 'more_ops']:
-                        await query.answer("该消息已过期，是否仍要操作？", show_alert=True)
-                        try:
-                            continue_buttons = [[
-                                InlineKeyboardButton("仍要操作", callback_data=f"continue_{action}:{key}"),
-                                InlineKeyboardButton("取消", callback_data="cancel_expired")
-                            ]]
-                            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(continue_buttons))
-                        except Exception:
-                            pass
-                        return
-                    elif action.startswith('continue_'):
-                        # 用户确认继续操作，使用解析出的地址
-                        payment, provider = fallback_addresses
-                        actual_action = action.replace('continue_', '')
-                        await query.answer("已使用解析的地址信息执行操作")
-                        # 继续执行下面的逻辑，使用解析出的地址
-                        action = actual_action
-                    else:
-                        await query.answer("操作已取消")
-                        return
-            else:
-                # 未过期且有缓存数据，正常处理
-                payment, provider = payload
-                await query.answer()
+            alert = await self._handle_feedback_click(query, context.bot)
+        except Exception:
+            logger.exception("处理个人反馈失败")
+            alert = "暂时无法显示反馈。请重新打开「我的反馈」核对记录。"
+        try:
+            await query.answer(text=alert, show_alert=bool(alert))
+        except TelegramError as error:
+            logger.warning("反馈回调应答失败: %s", error)
 
-            user_id = update.effective_user.id if update.effective_user else None
-            if action == 'vote_success':
-                # 先记票，再按票数决定临时/正式
-                await self.feedback_manager.record_vote(
-                    user_id, payment, provider, SCOPE_PAIR, VOTE_SUCCESS
-                )
-                await self.whitelist_manager.add_address(payment, 'payment', f'用户{user_id}反馈成功', user_id, is_provisional=True, from_feedback=True)
-                await self.whitelist_manager.add_address(provider, 'provider', f'用户{user_id}反馈成功', user_id, is_provisional=True, from_feedback=True)
-                await self.whitelist_manager.add_pair(payment, provider, user_id, is_provisional=True)
-                status_text = await self._sync_pair_status(payment, provider, VOTE_SUCCESS)
+    async def _handle_feedback_click(self, query, bot) -> Optional[str]:
+        message = query.message
+        if not isinstance(query.data, str) or not message or not getattr(message, "text", None):
+            return "无法识别这张地址卡片，请使用 /query 获取最新结果。"
+        action, _, key = query.data.partition(":")
+        # A stale or forged callback must not act on another address pair.
+        markup = getattr(message, "reply_markup", None)
+        if markup and not any(
+            b.callback_data == query.data for row in markup.inline_keyboard for b in row
+        ):
+            return "这个按钮已更新，请重新打开地址卡片。"
+        if action in {"cancel", "cancel_expired"}:
+            await close_panel(bot, query)
+            return None
+        if action == "expired_get_new":
+            return "请使用 /query 获取最新结果。"
 
-                # 发送确认消息（不编辑原文）
-                confirmation_text = (
-                    "✅ 已记录：您已成功获得能量\n\n"
-                    f"• 收款地址与能量提供方已加入白名单{status_text}\n"
-                    "• 24 小时内可点「撤回」取消本次反馈\n"
-                    "• 感谢您的反馈，已帮助他人判断可信地址"
-                )
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=confirmation_text,
-                    reply_to_message_id=query.message.message_id
-                )
-                
-                # 更新按钮为已记录状态
-                try:
-                    recorded_buttons = [[
-                        InlineKeyboardButton("✅ 已记录为成功", callback_data="recorded_success"),
-                        InlineKeyboardButton("撤回", callback_data=f"revoke_success:{key}")
-                    ]]
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
-                except Exception:
-                    pass
-            elif action == 'vote_fail':
-                # 先记票，再按票数决定临时/正式
-                await self.feedback_manager.record_vote(
-                    user_id, payment, provider, SCOPE_PAIR, VOTE_FAIL
-                )
-                await self.blacklist_manager.add_to_blacklist(payment, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True, from_feedback=True)
-                await self.blacklist_manager.add_to_blacklist(provider, f'用户{user_id}反馈未成功', user_id, 'manual', is_provisional=True, from_feedback=True)
-                # 触发一次关联逻辑（内部有开关）
-                try:
-                    await self.blacklist_manager.auto_associate_addresses(payment, provider)
-                except Exception:
-                    pass
-                status_text = await self._sync_pair_status(payment, provider, VOTE_FAIL)
+        action = action.removeprefix("continue_")
+        if action in {"recorded", "recorded_success", "recorded_fail"}:
+            action = "more_ops"
+        if action in {"revoke_success", "revoke_fail"}:
+            action = "revoke"
+        if action not in VOTE_ACTIONS and action not in {"more_ops", "revoke"}:
+            return "无法识别此操作，请使用 /query 获取最新结果。"
 
-                # 发送确认消息（不编辑原文）
-                confirmation_text = (
-                    "❌ 已记录：您未成功获得能量\n\n"
-                    f"• 收款地址与能量提供方已加入黑名单{status_text}\n"
-                    "• 24 小时内可点「撤回」取消本次反馈\n"
-                    "• 感谢您的反馈，已帮助他人规避风险"
-                )
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=confirmation_text,
-                    reply_to_message_id=query.message.message_id
-                )
-                
-                # 更新按钮为已记录状态
-                try:
-                    recorded_buttons = [[
-                        InlineKeyboardButton("❌ 已记录为失败", callback_data="recorded_fail"),
-                        InlineKeyboardButton("撤回", callback_data=f"revoke_fail:{key}")
-                    ]]
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
-                except Exception:
-                    pass
-            elif action == 'more_ops':
-                # 展开更多操作选择
-                buttons = [
-                    [InlineKeyboardButton('🧩 仅收款地址成功（加白）', callback_data=f'only_pay_wl:{key}')],
-                    [InlineKeyboardButton('🔋 仅提供方成功（加白）', callback_data=f'only_prov_wl:{key}')],
-                    [InlineKeyboardButton('🚩 仅收款地址有问题（加黑）', callback_data=f'only_pay_bl:{key}')],
-                    [InlineKeyboardButton('🧨 仅提供方有问题（加黑）', callback_data=f'only_prov_bl:{key}')],
-                    [InlineKeyboardButton('↩️ 撤回我的反馈', callback_data=f'revoke:{key}')],
-                    [InlineKeyboardButton('❌ 取消', callback_data=f'cancel:{key}')],
-                ]
-                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
-            elif action == 'only_pay_wl':
-                await self.feedback_manager.record_vote(
-                    user_id, payment, provider, SCOPE_PAYMENT, VOTE_SUCCESS
-                )
-                await self.whitelist_manager.add_address(payment, 'payment', '用户反馈：仅收款地址成功', user_id, is_provisional=True, from_feedback=True)
-                status_text = await self._sync_single_status(payment, 'payment', VOTE_SUCCESS)
-                # 发送确认消息
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f'✅ 已记录：仅收款地址加入白名单{status_text}。24 小时内可撤回。',
-                    reply_to_message_id=query.message.message_id
-                )
-                # 更新按钮
-                try:
-                    recorded_buttons = [[
-                        InlineKeyboardButton("✅ 收款地址已加白", callback_data="recorded"),
-                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
-                    ]]
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
-                except Exception:
-                    pass
-            elif action == 'only_prov_wl':
-                await self.feedback_manager.record_vote(
-                    user_id, payment, provider, SCOPE_PROVIDER, VOTE_SUCCESS
-                )
-                await self.whitelist_manager.add_address(provider, 'provider', '用户反馈：仅提供方成功', user_id, is_provisional=True, from_feedback=True)
-                status_text = await self._sync_single_status(provider, 'provider', VOTE_SUCCESS)
-                # 发送确认消息
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f'✅ 已记录：仅能量提供方加入白名单{status_text}。24 小时内可撤回。',
-                    reply_to_message_id=query.message.message_id
-                )
-                # 更新按钮
-                try:
-                    recorded_buttons = [[
-                        InlineKeyboardButton("✅ 提供方已加白", callback_data="recorded"),
-                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
-                    ]]
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
-                except Exception:
-                    pass
-            elif action == 'only_pay_bl':
-                await self.feedback_manager.record_vote(
-                    user_id, payment, provider, SCOPE_PAYMENT, VOTE_FAIL
-                )
-                await self.blacklist_manager.add_to_blacklist(payment, '用户反馈：仅收款地址有问题', user_id, 'manual', is_provisional=True, from_feedback=True)
-                status_text = await self._sync_single_status(payment, 'payment', VOTE_FAIL)
-                # 发送确认消息
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f'❌ 已记录：仅收款地址加入黑名单{status_text}。24 小时内可撤回。',
-                    reply_to_message_id=query.message.message_id
-                )
-                # 更新按钮
-                try:
-                    recorded_buttons = [[
-                        InlineKeyboardButton("❌ 收款地址已加黑", callback_data="recorded"),
-                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
-                    ]]
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
-                except Exception:
-                    pass
-            elif action == 'only_prov_bl':
-                await self.feedback_manager.record_vote(
-                    user_id, payment, provider, SCOPE_PROVIDER, VOTE_FAIL
-                )
-                await self.blacklist_manager.add_to_blacklist(provider, '用户反馈：仅提供方有问题', user_id, 'manual', is_provisional=True, from_feedback=True)
-                status_text = await self._sync_single_status(provider, 'provider', VOTE_FAIL)
-                try:
-                    await self.blacklist_manager.auto_associate_addresses(payment, provider)
-                except Exception:
-                    pass
-                # 发送确认消息
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=f'❌ 已记录：仅能量提供方加入黑名单{status_text}。24 小时内可撤回。',
-                    reply_to_message_id=query.message.message_id
-                )
-                # 更新按钮
-                try:
-                    recorded_buttons = [[
-                        InlineKeyboardButton("❌ 提供方已加黑", callback_data="recorded"),
-                        InlineKeyboardButton("↩️ 撤回", callback_data=f"revoke:{key}")
-                    ]]
-                    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(recorded_buttons))
-                except Exception:
-                    pass
-            elif action in ['revoke', 'revoke_success', 'revoke_fail']:
-                revoked = await self._revoke_user_feedback(user_id, payment, provider)
-                if not revoked:
-                    await query.answer(
-                        'ℹ️ 没有可撤回的反馈（仅支持撤回本人 24 小时内的投票）',
-                        show_alert=True
+        if re.fullmatch(r"p[0-9a-f]{32}", key):
+            pair = await self.feedback_manager.card_addresses(key)
+        else:
+            # Historical buttons used a process-local key, sometimes no key at all.
+            pair = self._parse_message_for_addresses(message.text)
+            if pair:
+                key = await self.feedback_manager.card_key(*pair)
+        if not pair:
+            return "无法可靠识别收款地址和提供方，请使用 /query 获取最新结果。"
+        if not markup and self._parse_message_for_addresses(message.text) != pair:
+            return "无法识别这个按钮，请重新打开地址卡片。"
+
+        if ephemeral_id(query) is None and self._is_message_expired(message.date) and action != "revoke":
+            markup = InlineKeyboardMarkup([[
+                button("仍要操作", action, key), button("取消", "cancel", key)
+            ]])
+            await show_panel(bot, query, "这张地址卡片已超过 7 天，仍要继续吗？", markup)
+            return None
+
+        user_id = query.from_user.id
+        notice = "我的反馈"
+        if action in VOTE_ACTIONS:
+            scope, vote = VOTE_ACTIONS[action]
+            notice = await self._apply_feedback_vote(user_id, *pair, scope, vote)
+        elif action == "revoke":
+            async with feedback_transaction(*pair):
+                revoked = await self._revoke_user_feedback(user_id, *pair)
+            notice = "已撤回本人 24 小时内的反馈。" if revoked else "没有可撤回的反馈。"
+        votes = await self.feedback_manager.get_user_votes(user_id, *pair)
+        if action == "more_ops" and not votes:
+            notice = "你还没有对这组地址提交反馈。"
+        text, markup = personal_panel(key, votes, notice, show_options=action == "more_ops")
+        await show_panel(bot, query, text, markup)
+        return None
+
+    async def _apply_feedback_vote(self, user_id, payment, provider, scope, vote) -> str:
+        success = vote == VOTE_SUCCESS
+        result = "已到账" if success else "未到账"
+        targets = [(payment, SCOPE_PAYMENT), (provider, SCOPE_PROVIDER)]
+        async with feedback_transaction(payment, provider):
+            changed = await self.feedback_manager.record_vote(user_id, payment, provider, scope, vote)
+            if not changed:
+                return "此前已记录相同反馈，撤回截止时间按原记录计算。"
+            for address, role in targets:
+                if scope not in (SCOPE_PAIR, role):
+                    continue
+                reason = f"用户{user_id}反馈{result}"
+                if success:
+                    added = await self.whitelist_manager.add_address(
+                        address, role, reason, user_id, is_provisional=True, from_feedback=True
                     )
-                    return
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text='↩️ 已撤回您的反馈，相关名单记录已按剩余票数重算。',
-                    reply_to_message_id=query.message.message_id
-                )
-                try:
-                    original_markup = self._build_inline_keyboard({
-                        'address': payment,
-                        'energy_provider': provider
-                    })
-                    await query.edit_message_reply_markup(reply_markup=original_markup)
-                except Exception:
-                    pass
-            elif action == 'cancel' or action == 'cancel_expired':
-                # 取消操作：恢复原始按钮
-                if payment and provider:
-                    original_markup = self._build_inline_keyboard({
-                        'address': payment,
-                        'energy_provider': provider
-                    })
-                    try:
-                        await query.edit_message_reply_markup(reply_markup=original_markup)
-                        await query.answer("已取消，已恢复原始选项")
-                    except Exception:
-                        await query.answer("操作已取消")
                 else:
-                    await query.answer("操作已取消")
-            elif action in ['recorded_success', 'recorded_fail', 'recorded', 'expired_get_new']:
-                # 已记录状态的按钮点击
-                if action == 'expired_get_new':
-                    await query.answer("请使用 /query 命令获取最新地址信息", show_alert=True)
-                else:
-                    await query.answer("该操作已记录，可点「撤回」取消本人 24 小时内的反馈")
+                    added = await self.blacklist_manager.add_to_blacklist(
+                        address, reason, user_id, is_provisional=True, from_feedback=True
+                    )
+                if not added:
+                    raise RuntimeError("反馈名单写入失败")
+            if scope == SCOPE_PAIR:
+                if success:
+                    await self.whitelist_manager.add_pair(payment, provider, user_id)
+                status = await self._sync_pair_status(payment, provider, vote)
             else:
-                await query.answer('操作已完成')
-        except Exception as e:
-            logger.error(f"处理回调失败: {e}")
-            
+                address = payment if scope == SCOPE_PAYMENT else provider
+                counts = await self._reconcile_address_lists(address, scope)
+                status = self._vote_status_suffix(counts[vote])
+        if not success and scope in (SCOPE_PAIR, SCOPE_PROVIDER):
+            await self.blacklist_manager.auto_associate_addresses(payment, provider)
+        return f"已记录 · {SCOPE_LABELS[scope]} · {result}{status}"
+
     async def _reconcile_address_lists(self, address: str, address_type: str) -> Dict[str, int]:
         """按该地址当前的有效票数重算白/黑名单归属，返回各票种票数
 
@@ -1188,11 +968,13 @@ class TronEnergyBot:
             )
 
         if fail_votes == 0:
-            await self.blacklist_manager.remove_from_blacklist(address, only_feedback=True)
+            updated = await self.blacklist_manager.remove_from_blacklist(address, only_feedback=True)
         else:
-            await self.blacklist_manager.set_provisional(
+            updated = await self.blacklist_manager.set_provisional(
                 address, fail_votes < CONFIRM_THRESHOLD
             )
+        if updated is False:
+            raise RuntimeError("重算反馈黑名单失败")
 
         return counts
 
@@ -1203,68 +985,51 @@ class TronEnergyBot:
             return f"（临时，{votes} 票）"
         return f"（已确认，{votes} 票）"
 
-    async def _sync_single_status(self, address: str, address_type: str, vote_type: str) -> str:
-        """单边投票后重算该地址的名单归属，返回展示后缀"""
-        try:
-            counts = await self._reconcile_address_lists(address, address_type)
-            return self._vote_status_suffix(counts.get(vote_type, 0))
-        except Exception as e:
-            logger.error(f"同步名单状态失败: {e}")
-            return "（临时）"
-
     async def _sync_pair_status(self, payment: str, provider: str, vote_type: str) -> str:
         """组合投票后重算双方及组合的名单归属，返回展示后缀"""
-        try:
-            await self._reconcile_address_lists(payment, 'payment')
-            await self._reconcile_address_lists(provider, 'provider')
+        await self._reconcile_address_lists(payment, 'payment')
+        await self._reconcile_address_lists(provider, 'provider')
 
-            counts = await self.feedback_manager.count_votes(
-                payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
+        counts = await self.feedback_manager.count_votes(
+            payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
+        )
+        success_votes = counts.get(VOTE_SUCCESS, 0)
+        fail_votes = counts.get(VOTE_FAIL, 0)
+
+        if success_votes == 0:
+            await self.whitelist_manager.remove_pair(payment, provider)
+        else:
+            await self.whitelist_manager.set_pair_provisional(
+                payment, provider, success_votes < CONFIRM_THRESHOLD
             )
-            success_votes = counts.get(VOTE_SUCCESS, 0)
-            fail_votes = counts.get(VOTE_FAIL, 0)
 
-            if success_votes == 0:
-                await self.whitelist_manager.remove_pair(payment, provider)
-            else:
-                await self.whitelist_manager.set_pair_provisional(
-                    payment, provider, success_votes < CONFIRM_THRESHOLD
-                )
-
-            suffix = self._vote_status_suffix(counts.get(vote_type, 0))
-            if success_votes and fail_votes:
-                suffix += f"\n• 该组合当前反馈：成功 {success_votes} 票 / 未成功 {fail_votes} 票"
-            return suffix
-        except Exception as e:
-            logger.error(f"同步组合状态失败: {e}")
-            return "（临时）"
+        suffix = self._vote_status_suffix(counts.get(vote_type, 0))
+        if success_votes and fail_votes:
+            suffix += f"\n• 该组合当前反馈：成功 {success_votes} 票 / 未成功 {fail_votes} 票"
+        return suffix
 
     async def _revoke_user_feedback(self, user_id: Optional[int], payment: str, provider: str) -> bool:
         """撤回用户在时间窗内的投票，并按剩余票数重算名单条目"""
         if not user_id:
             return False
-        try:
-            revoked = await self.feedback_manager.revoke_votes(user_id, payment, provider)
-            if not revoked:
-                return False
-
-            for address, address_type in ((payment, 'payment'), (provider, 'provider')):
-                await self._reconcile_address_lists(address, address_type)
-
-            pair_counts = await self.feedback_manager.count_votes(
-                payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
-            )
-            if pair_counts.get(VOTE_SUCCESS, 0) == 0:
-                await self.whitelist_manager.remove_pair(payment, provider)
-            else:
-                await self.whitelist_manager.set_pair_provisional(
-                    payment, provider,
-                    pair_counts[VOTE_SUCCESS] < CONFIRM_THRESHOLD
-                )
-            return True
-        except Exception as e:
-            logger.error(f"撤回反馈失败: {e}")
+        revoked = await self.feedback_manager.revoke_votes(user_id, payment, provider)
+        if not revoked:
             return False
+
+        for address, address_type in ((payment, 'payment'), (provider, 'provider')):
+            await self._reconcile_address_lists(address, address_type)
+
+        pair_counts = await self.feedback_manager.count_votes(
+            payment_address=payment, provider_address=provider, scope=SCOPE_PAIR
+        )
+        if pair_counts.get(VOTE_SUCCESS, 0) == 0:
+            await self.whitelist_manager.remove_pair(payment, provider)
+        else:
+            await self.whitelist_manager.set_pair_provisional(
+                payment, provider,
+                pair_counts[VOTE_SUCCESS] < CONFIRM_THRESHOLD
+            )
+        return True
 
     async def _disable_invalid_channel(self, chat_id: int, error: Exception) -> None:
         error_text = str(error)
@@ -1303,7 +1068,7 @@ class TronEnergyBot:
         sent_addresses: List[str] = []
         for addr in fresh_addresses:
             text = prefix + self.format_address_info(addr)
-            markup = self._build_inline_keyboard(addr)
+            markup = await self._build_inline_keyboard(addr)
             try:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -1571,4 +1336,4 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main() 
+    main()
